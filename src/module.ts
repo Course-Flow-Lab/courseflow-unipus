@@ -1089,6 +1089,7 @@ async function solveTextQuestions(
     '你是 U校园英语练习答题助手。',
     '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
     '简答题/填空题给出简短、直接、符合题意的英文答案。',
+    '原文里的 ____1____、____2____ 是待填空位，题目 id 对应空位编号，按编号填写。',
     context.trim() ? `听力/视频原文：\n${context.trim()}` : '',
     JSON.stringify(questions),
   ].join('\n');
@@ -1322,7 +1323,8 @@ async function studyFillblankBrowser(
 ) {
   let answers = scriptAnswers(decoded);
   if (answers.length === 0) {
-    const solved = await solveTextQuestions(session, questionGroup);
+    const context = await collectStudyContext(session, decoded);
+    const solved = await solveTextQuestions(session, questionGroup, context);
     if (solved) {
       answers = (questionGroup.questions ?? []).map(
         (_: any, index: number) => solved[String(index)]?.[0] ?? '',
@@ -1433,7 +1435,8 @@ async function studyObjectiveApi(
   if (isFill) {
     if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
-      const solved = await solveTextQuestions(session, questionGroup);
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveTextQuestions(session, questionGroup, context);
       if (!solved) return { status: 'needs_human', reason: 'fillblankScoop 没有答案来源' };
       values = questions.map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
     }

@@ -917,6 +917,7 @@ async function solveTextQuestions(session, group, context = "") {
     "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
     '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
     "\u7B80\u7B54\u9898/\u586B\u7A7A\u9898\u7ED9\u51FA\u7B80\u77ED\u3001\u76F4\u63A5\u3001\u7B26\u5408\u9898\u610F\u7684\u82F1\u6587\u7B54\u6848\u3002",
+    "\u539F\u6587\u91CC\u7684 ____1____\u3001____2____ \u662F\u5F85\u586B\u7A7A\u4F4D\uFF0C\u9898\u76EE id \u5BF9\u5E94\u7A7A\u4F4D\u7F16\u53F7\uFF0C\u6309\u7F16\u53F7\u586B\u5199\u3002",
     context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
 ${context.trim()}` : "",
     JSON.stringify(questions)
@@ -1117,7 +1118,8 @@ async function browserStudy(session, courseId, groupId, url, mode, values, auth,
 async function studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
   let answers = scriptAnswers(decoded);
   if (answers.length === 0) {
-    const solved = await solveTextQuestions(session, questionGroup);
+    const context = await collectStudyContext(session, decoded);
+    const solved = await solveTextQuestions(session, questionGroup, context);
     if (solved) {
       answers = (questionGroup.questions ?? []).map(
         (_, index) => solved[String(index)]?.[0] ?? ""
@@ -1204,7 +1206,8 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
   if (isFill) {
     if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
-      const solved = await solveTextQuestions(session, questionGroup);
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveTextQuestions(session, questionGroup, context);
       if (!solved) return { status: "needs_human", reason: "fillblankScoop \u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
       values = questions.map((_, index) => solved[String(index)]?.[0] ?? "");
     }
