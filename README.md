@@ -98,6 +98,16 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 选择题现在会把 `content[].audio.script` 的听力原文、`content[].scoop.html` 的阅读材料和 `content[].video.file` 的 VTT 字幕一起注入模型 prompt，不再只靠题干和选项猜答案。没有原文的题组会退回只发题干和选项。
 
+如果 `audio.script` 和 VTT 都没有，模块会下载音频并调用 `scripts/transcribe_audio.py` 做本地转写：
+
+- 依赖 `faster-whisper` 和 `ffmpeg`
+- 默认模型 `base.en`
+- HuggingFace 下载默认走 `https://hf-mirror.com`，可用 `HF_ENDPOINT` 覆盖
+- 转写文本会缓存到模块进程内，避免同一任务重复跑
+- 典型 2.5 分钟音频约 20 秒完成
+
+实测 `u4g624` 这类没有原文的多选题：ASR 得到 2285 字符，提交 100 分。
+
 ### 多页题组（Short conversations）
 
 多页题组和单页结构不同：
@@ -201,13 +211,18 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 题组有开放时间：`flowStrategy.startTime` 未到时平台会提示“学习开始时间未到，不能提交”；模块在打开浏览器前直接返回 `blocked`，不会白白消耗首次得分。
 - 首次得分锁定：`record_every_submit=false`、`record_max_submit=false`，第一次提交必须用正确答案。
 - 多页题组、排序题、多选题都走 API 自动提交；浏览器路径仍只用于单页单选/填空。
-- 多选题如果既没有 `audio.script` 也没有 VTT（例如 `u4g624`），模型只能靠题目和选项猜，正确率无法保证；这类题建议先补音频转写或人工答案。
+- ASR 是本地 CPU 转写，2.5 分钟音频约 20 秒；如果框架调用预算更紧，可把 `asr_model` 改成 `tiny.en`，或提前把模型缓存好。
+- ASR 依赖 `python`、`faster-whisper`、`ffmpeg`；模块安装时会把 `scripts/transcribe_audio.py` 一起复制。
 
 ## 安装
 
 ```bash
 npm install
 npm run build
+
+# 可选：没有 audio.script/VTT 时需要本地 ASR
+python -m pip install faster-whisper
+# 并确保 ffmpeg 在 PATH 里
 ```
 
 在 Courseflow 里：
@@ -233,6 +248,10 @@ npm run cli -- module config unipus_classic '{
 | `content_base_url` | 默认 `https://ucontent.unipus.cn` |
 | `browser_study` | 默认 `true`；用官方浏览器（Playwright/CDP）做客观题 |
 | `enable_task_submit` | 默认 `false`；`browser_study=false` 时允许走 API 提交客观题 |
+| `asr_enabled` | 默认 `true`；没有原文/VTT 时用 faster-whisper 转写音频 |
+| `asr_python` | 默认 `python`；指向装有 `faster-whisper` 的 Python |
+| `asr_model` | 默认 `base.en`；可改 `tiny.en` 降低耗时 |
+| `asr_timeout_ms` | 默认 `24000`；ASR 超时时间 |
 
 ## 协议要点
 

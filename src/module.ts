@@ -1,6 +1,10 @@
 import { createCipheriv, createDecipheriv } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const MANIFEST = JSON.parse(
   readFileSync(new URL('./courseflow.module.json', import.meta.url), 'utf8'),
@@ -44,6 +48,16 @@ const DB_COURSE_ID = (() => {
   return match ? match[1] : '';
 })();
 const BROWSER_STUDY = SETTINGS.browser_study !== false;
+const ASR_ENABLED = SETTINGS.asr_enabled !== false;
+const ASR_PYTHON =
+  typeof SETTINGS.asr_python === 'string' && SETTINGS.asr_python.trim()
+    ? SETTINGS.asr_python.trim()
+    : 'python';
+const ASR_MODEL =
+  typeof SETTINGS.asr_model === 'string' && SETTINGS.asr_model.trim()
+    ? SETTINGS.asr_model.trim()
+    : 'base.en';
+const ASR_TIMEOUT_MS = Number(SETTINGS.asr_timeout_ms ?? 24000);
 
 const LOGIN_AES_KEY = Buffer.from('8AD70B641C024C7ADA2ECD082EC0334F', 'hex');
 const LOGIN_AES_IV = Buffer.from('0102030405060708090A0B0C0D0E0F10', 'hex');
@@ -880,9 +894,75 @@ function parseVtt(text: string): string {
   return out.join(' ');
 }
 
+const asrCache = new Map<string, string>();
+
+async function transcribeAudio(session: string, audioUrl: string): Promise<string> {
+  if (!ASR_ENABLED) return '';
+  const url = audioUrl.replace(/#.*$/, '');
+  if (asrCache.has(url)) return asrCache.get(url) ?? '';
+  let binary: any = null;
+  try {
+    binary = await hostCall('cw.net.fetch', {
+      session,
+      method: 'GET',
+      url,
+      headers: { ...BROWSER_HEADERS, accept: '*/*' },
+      stage: 'read',
+      binary: true,
+    });
+  } catch (error) {
+    log('warn', `asr download failed: ${errorText(error)}`);
+    return '';
+  }
+  if (!binary?.body) return '';
+  const dir = mkdtempSync(join(tmpdir(), 'courseflow-asr-'));
+  const audioPath = join(dir, 'audio.mp3');
+  const scriptPath = fileURLToPath(new URL('./scripts/transcribe_audio.py', import.meta.url));
+  try {
+    writeFileSync(audioPath, Buffer.from(String(binary.body), 'base64'));
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = spawn(ASR_PYTHON, [scriptPath, audioPath, ASR_MODEL], {
+        env: {
+          ...process.env,
+          PYTHONIOENCODING: 'utf-8',
+          HF_ENDPOINT: process.env.HF_ENDPOINT || process.env.CF_ASR_HF_ENDPOINT || 'https://hf-mirror.com',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error(`ASR timeout ${ASR_TIMEOUT_MS}ms`));
+      }, ASR_TIMEOUT_MS);
+      child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+      child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+      child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      child.once('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`ASR exit ${code}: ${stderr.slice(-300)}`));
+      });
+    });
+    const parsed = JSON.parse(output.trim());
+    const text = String(parsed?.text ?? '').trim();
+    if (text) {
+      asrCache.set(url, text);
+      log('info', `asr ${url.slice(-48)} -> ${text.length} chars`);
+    }
+    return text;
+  } catch (error) {
+    log('warn', `asr failed: ${errorText(error)}`);
+    return '';
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function collectStudyContext(session: string, decoded: any): Promise<string> {
   const parts: string[] = [];
   const seenVtt = new Set<string>();
+  const seenAsr = new Set<string>();
   if (!decoded || typeof decoded !== 'object') return '';
   for (const group of Object.values(decoded) as any[]) {
     for (const content of group?.content ?? []) {
@@ -911,6 +991,18 @@ async function collectStudyContext(session: string, decoded: any): Promise<strin
         } catch (error) {
           log('warn', `vtt ${videoFile} failed: ${errorText(error)}`);
         }
+      }
+      const audioUrl = content?.audio?.audio?.url;
+      if (
+        !scriptHtml &&
+        !videoFile &&
+        typeof audioUrl === 'string' &&
+        audioUrl &&
+        !seenAsr.has(audioUrl)
+      ) {
+        seenAsr.add(audioUrl);
+        const text = await transcribeAudio(session, audioUrl);
+        if (text) parts.push(text);
       }
     }
   }

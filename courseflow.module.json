@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "moduleApi": 1,
   "engines": { "framework": ">=0.1.1 <0.2.0" },
-  "runtime": { "engine": "node", "entry": "index.mjs", "files": [] },
+  "runtime": { "engine": "node", "entry": "index.mjs", "files": ["scripts/transcribe_audio.py"] },
   "platform": {
     "id": "unipus_classic",
     "name": "U校园普通版",
