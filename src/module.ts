@@ -1100,16 +1100,14 @@ async function studyChoiceBrowser(
   session: string,
   courseId: string,
   groupId: string,
-  decoded: any,
+  questionGroup: any,
   questionsList: any[],
   auth: any,
   minScorePct: number,
 ) {
-  const choice = findChoiceGroup(decoded);
-  if (!choice) return { status: 'needs_human', reason: '没有找到选择题组' };
-  const solved = await solveChoiceQuestions(session, choice.group);
+  const solved = await solveChoiceQuestions(session, questionGroup);
   if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
-  const captions = choiceCaptions(choice.group, solved);
+  const captions = choiceCaptions(questionGroup, solved);
   const result = await browserStudy(
     session,
     courseId,
@@ -1382,7 +1380,7 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     }
     if (BROWSER_STUDY) {
       const browserResult: any = await studyChoiceBrowser(
-        session, courseId, groupId, decoded, questionsList, auth, minScorePct,
+        session, courseId, groupId, questionGroup, questionsList, auth, minScorePct,
       );
       if (browserResult.status === 'completed') return browserResult;
       const rawState = browserResult?.evidence?.state;

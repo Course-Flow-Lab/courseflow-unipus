@@ -127,6 +127,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - u4g254（fillblankScoop，10 空，required）：100 分
 - u3g192（singlechoice，2 题）：100 分
 - u8g514（Short conversations，多页 5 题）：100 分
+- u4g250（Short conversations，多页 5 题，required）：100 分
 
 流程：
 

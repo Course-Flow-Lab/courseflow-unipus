@@ -935,12 +935,10 @@ function choiceCaptions(group, solved) {
     return matchChoiceCaption(options, solved[String(index)] ?? []);
   });
 }
-async function studyChoiceBrowser(session, courseId, groupId, decoded, questionsList, auth, minScorePct) {
-  const choice = findChoiceGroup(decoded);
-  if (!choice) return { status: "needs_human", reason: "\u6CA1\u6709\u627E\u5230\u9009\u62E9\u9898\u7EC4" };
-  const solved = await solveChoiceQuestions(session, choice.group);
+async function studyChoiceBrowser(session, courseId, groupId, questionGroup, questionsList, auth, minScorePct) {
+  const solved = await solveChoiceQuestions(session, questionGroup);
   if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
-  const captions = choiceCaptions(choice.group, solved);
+  const captions = choiceCaptions(questionGroup, solved);
   const result = await browserStudy(
     session,
     courseId,
@@ -1214,7 +1212,7 @@ async function studyTask(session, courseId, unit, auth) {
         session,
         courseId,
         groupId,
-        decoded,
+        questionGroup,
         questionsList,
         auth,
         minScorePct
