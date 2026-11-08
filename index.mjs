@@ -753,7 +753,15 @@ async function studyTask(session, courseId, unit, auth) {
   if (!questionGroup) {
     return { status: "needs_human", reason: "\u9898\u7EC4\u5185\u5BB9\u91CC\u6CA1\u6709\u9898\u76EE" };
   }
-  const choice = findChoiceGroup(decoded);
+  const category = String(questionGroup.category ?? "").toLowerCase();
+  const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
+  if (objective && SETTINGS.enable_task_submit !== true) {
+    return {
+      status: "needs_human",
+      reason: `\u5BA2\u89C2\u9898\uFF08${category || "unknown"}\uFF09\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED`
+    };
+  }
+  const choice = objective ? findChoiceGroup(decoded) : null;
   const solved = choice ? await solveChoiceQuestions(session, choice.group) : await solveTextQuestions(session, questionGroup);
   if (!solved) {
     return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u7B54\u6848" };

@@ -884,7 +884,15 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
   if (!questionGroup) {
     return { status: 'needs_human', reason: '题组内容里没有题目' };
   }
-  const choice = findChoiceGroup(decoded);
+  const category = String(questionGroup.category ?? '').toLowerCase();
+  const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
+  if (objective && SETTINGS.enable_task_submit !== true) {
+    return {
+      status: 'needs_human',
+      reason: `客观题（${category || 'unknown'}）会计分，自动提交默认关闭`,
+    };
+  }
+  const choice = objective ? findChoiceGroup(decoded) : null;
   const solved = choice
     ? await solveChoiceQuestions(session, choice.group)
     : await solveTextQuestions(session, questionGroup);

@@ -44,10 +44,12 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
   但真正计分还依赖 `scoreType`、`question_type`、`versions` 等元数据；目前提交后 `real_score_pct` 仍为 0。
 - 平台默认按“首次得分”记录（`record_every_submit=false`、`record_max_submit=false`），所以“先乱填、再按标准答案重交”无法把分数改回来。
 - 处理策略：
-  - `task_mini_score_pct = 0` 的任务视为“交了就算过、分数不计入要求”，模块会自动提交并标记完成（单选题选一个选项，简答题写一段占位/模型答案）。
-  - `task_mini_score_pct > 0` 的计分题默认暂停，只有设置 `enable_task_submit: true` 才自动提交。
+  - 判断题、选择题、填空题属于**客观题**，会计分；默认暂停自动提交。
+  - 简答题、写作、翻译等**主观题**才按“写了就行”处理：自动提交文本并标记完成。
+  - `task_mini_score_pct = 0` 只表示该任务“交了就算过”，不代表分数不计入课程成绩。
+  - 客观题只有设置 `enable_task_submit: true` 且能提供答案时才自动提交。
 
-实测样本：u2g76、u2g567、u2g72 提交后 `pass=1`；其中 u2g76 的 `score_avg=0`，符合“不计分”任务的特征。
+实测：u2g72（简答）提交后 `pass=1`；u2g76、u2g567 属于客观题，即使 `pass=1` 也会记录 0 分。
 
 已确认可用：
 
