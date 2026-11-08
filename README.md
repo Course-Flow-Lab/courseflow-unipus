@@ -252,6 +252,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - ASR 是本地 CPU 转写，2.5 分钟音频约 20 秒；如果框架调用预算更紧，可把 `asr_model` 改成 `tiny.en`，或提前把模型缓存好。
 - ASR 依赖 `python`、`faster-whisper`、`ffmpeg`；模块安装时会把 `scripts/transcribe_audio.py` 一起复制。
 - 口语/录音题（roleplay、presentation、sentencesforrecord）不做自动提交，统一返回 `needs_human`。
+- 单元测试 `quiz-paper-link` 已纳入目录，并带 `exercise_id`/`exam_id` 元数据；它实际是 `uexercise.unipus.cn` 的独立试卷应用（25 题，含听力/听写），当前只返回 `needs_human`，不自动交卷。
 
 ## 安装
 

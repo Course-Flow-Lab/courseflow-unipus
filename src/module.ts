@@ -525,6 +525,37 @@ async function catalogUnits(params: any) {
     }
 
     const walk = (node: any, parentId: string) => {
+      if (node?.role === 'link' && node.url) {
+        let exam: any = null;
+        try {
+          exam = JSON.parse(String(node.summary ?? ''));
+        } catch {}
+        if (exam && (exam.exerciseId || exam.examId)) {
+          const pass = Number(leafs?.[node.url]?.state?.pass ?? 0);
+          units.push({
+            id: `${node.url}::quiz-paper-link`,
+            name: String(node.name ?? node.url).trim(),
+            chapter_id: unitId,
+            chapter_name: `${String(unit.caption ?? '').trim()} ${String(unit.name ?? '').trim()}`.trim(),
+            lesson_id: parentId,
+            kind: 'document',
+            duration_seconds: 0,
+            watched_seconds: 0,
+            state: pass === 1 ? 'completed' : 'not_started',
+            video_id: null,
+            selectable: true,
+            selectable_note: 'quiz-paper-link',
+            exam: {
+              exercise_id: String(exam.exerciseId ?? ''),
+              exam_id: String(exam.examId ?? ''),
+              question_number: String(exam.questionNumber ?? ''),
+              total_score: String(exam.totalScore ?? ''),
+              type: String(exam.type ?? ''),
+            },
+          });
+        }
+        return;
+      }
       if (node?.role === 'group' && node.url) {
         const tab = String(node.tab_type ?? '');
         const base = String(node.base ?? '');
@@ -1681,6 +1712,13 @@ async function studyShortAnswerApi(
 
 async function studyTask(session: string, courseId: string, unit: any, auth: any) {
   const groupId = String(unit.id ?? '').split('::')[0];
+  if (String(unit.selectable_note ?? '') === 'quiz-paper-link' || unit.exam) {
+    return {
+      status: 'needs_human',
+      reason: '单元测试是独立的 uexercise 试卷应用，当前只接入目录，不自动答题/交卷',
+      evidence: { exam: unit.exam ?? null },
+    };
+  }
   let minScorePct = 0;
   let progressData: any = null;
   try {
