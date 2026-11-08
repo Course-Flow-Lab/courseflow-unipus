@@ -778,6 +778,94 @@ async function solveChoiceQuestions(
   return out;
 }
 
+async function askAiForItems(session: string, prompt: string): Promise<any[] | null> {
+  let parsed: any = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await hostCall('cw.ai.generate', {
+      session,
+      prompt: attempt === 0 ? prompt : `${prompt}\n上次输出不是合法 JSON；这次只输出 JSON。`,
+    });
+    const raw = String((response as any)?.text ?? '').trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+    try {
+      parsed = JSON.parse(raw);
+      break;
+    } catch {
+      // retry
+    }
+  }
+  return Array.isArray(parsed) ? parsed : null;
+}
+
+function answerMapFromItems(items: any[] | null): Record<string, string[]> | null {
+  if (!items) return null;
+  const out: Record<string, string[]> = {};
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const id = String(item.id ?? '');
+    const texts = Array.isArray(item.texts)
+      ? item.texts.map(String)
+      : Array.isArray(item.answers)
+        ? item.answers.map(String)
+        : [];
+    if (id) out[id] = texts;
+  }
+  return out;
+}
+
+async function solveSequenceQuestions(
+  session: string,
+  group: any,
+  context = '',
+): Promise<Record<string, string[]> | null> {
+  const questions = (group.questions ?? []).map((question: any, index: number) => ({
+    id: String(index),
+    stem: stripHtml(question?.content?.html),
+  }));
+  const options = (group.options ?? []).map((option: any) => ({
+    caption: String(option?.caption ?? ''),
+    text: stripHtml(option?.content?.html),
+  }));
+  if (questions.length === 0 || options.length === 0) return null;
+  const prompt = [
+    '你是 U校园英语练习答题助手。',
+    '这是排序/匹配题。题目中的图片或空格按顺序对应听力原文中的人物或段落。',
+    '请根据原文，把每个题目匹配到正确选项。',
+    '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["A"]}，texts 只放一个选项 caption。',
+    context.trim() ? `听力/视频原文：\n${context.trim()}` : '',
+    `选项：${JSON.stringify(options)}`,
+    JSON.stringify(questions),
+  ].join('\n');
+  return answerMapFromItems(await askAiForItems(session, prompt));
+}
+
+async function solveMultiChoiceQuestions(
+  session: string,
+  group: any,
+  context = '',
+): Promise<Record<string, string[]> | null> {
+  const questions = (group.questions ?? []).map((question: any, index: number) => ({
+    id: String(index),
+    stem: stripHtml(question?.content?.html),
+    options: (question?.options ?? []).map((option: any) => ({
+      caption: String(option?.caption ?? ''),
+      text: stripHtml(option?.content?.html),
+    })),
+  }));
+  if (questions.length === 0) return null;
+  const prompt = [
+    '你是 U校园英语练习答题助手。',
+    '这是多选题，每道题可能有多个正确选项。',
+    '根据听力/视频原文和题目，选出所有正确选项。',
+    '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["A","C"]}。',
+    context.trim() ? `听力/视频原文：\n${context.trim()}` : '',
+    JSON.stringify(questions),
+  ].join('\n');
+  return answerMapFromItems(await askAiForItems(session, prompt));
+}
+
 function parseVtt(text: string): string {
   const out: string[] = [];
   for (const raw of String(text).split(/\r?\n/)) {
@@ -1205,18 +1293,35 @@ async function studyObjectiveApi(
   indexMap: any,
   auth: any,
   minScorePct: number,
-  precomputedValues?: string[],
+  precomputedValues?: any[],
 ) {
   const category = String(questionGroup.category ?? '').toLowerCase();
   const isFill = /fillblank/.test(category);
-  const choice = isFill ? null : { group: questionGroup, category };
-  let values: string[] = precomputedValues ?? [];
+  const isSequence = category === 'sequence';
+  const isMulti = category === 'multichoice';
+  const choice = !isFill && !isSequence && !isMulti ? { group: questionGroup, category } : null;
+  const questions = questionGroup.questions ?? [];
+  let values: any[] = precomputedValues ?? [];
   if (isFill) {
     if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
       const solved = await solveTextQuestions(session, questionGroup);
       if (!solved) return { status: 'needs_human', reason: 'fillblankScoop 没有答案来源' };
-      values = (questionGroup.questions ?? []).map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
+      values = questions.map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
+    }
+  } else if (isSequence) {
+    if (values.length === 0) {
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveSequenceQuestions(session, questionGroup, context);
+      if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的排序题答案' };
+      values = questions.map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
+    }
+  } else if (isMulti) {
+    if (values.length === 0) {
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveMultiChoiceQuestions(session, questionGroup, context);
+      if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的多选题答案' };
+      values = questions.map((_: any, index: number) => solved[String(index)] ?? []);
     }
   } else if (choice) {
     if (values.length === 0) {
@@ -1229,7 +1334,6 @@ async function studyObjectiveApi(
     return { status: 'needs_human', reason: `未支持的客观题类型 ${category || 'unknown'}` };
   }
 
-  const questions = questionGroup.questions ?? [];
   if (values.length === 0) return { status: 'needs_human', reason: '没有构造出答案' };
   const userState = await fetchUserState(session, courseId, groupId, auth);
   const version = String(
@@ -1247,13 +1351,18 @@ async function studyObjectiveApi(
     const pageId = String(path[1] ?? 'p_1');
     const meta = pageMeta(indexMap, pageId);
     const qid = meta.qid ?? firstQid;
+    const defaultRule = isFill ? 'in' : isSequence ? 'eq_ig_case' : isMulti ? 'contain' : 'eq';
     const rule = String(
       (Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules) ??
-        (isFill ? 'in' : 'eq'),
+        defaultRule,
     );
-    const value = values[index] ?? '';
-    const answerIndex = multiPage ? 0 : index;
-    const offset = multiPage ? index : 0;
+    const rawValue = values[index];
+    const value = isMulti
+      ? (Array.isArray(rawValue) ? rawValue.map(String) : rawValue ? [String(rawValue)] : [])
+      : String(rawValue ?? '');
+    const slicedPage = multiPage && !isSequence && !isMulti;
+    const answerIndex = slicedPage ? 0 : index;
+    const offset = slicedPage ? index : 0;
     answerList[String(index)] = {
       student_answer: value,
       isDone: true,
@@ -1277,10 +1386,18 @@ async function studyObjectiveApi(
     const existingComponent = userState?.state?.[pageId]
       ? Object.keys(userState.state[pageId])[0]
       : '';
-    const component = existingComponent || 'c_1_1';
-    pages[pageId] ??= { [component]: { student_answers: multiPage ? [] : {} } };
-    if (multiPage) pages[pageId][component].student_answers[0] = value;
-    else pages[pageId][component].student_answers[String(index)] = value;
+    const component = existingComponent || (isSequence ? 'c_1_0' : 'c_1_1');
+    if (isMulti) {
+      pages[pageId] ??= { [component]: { student_answers: [] } };
+      pages[pageId][component].student_answers[index] = value;
+    } else if (isSequence) {
+      pages[pageId] ??= { [component]: { student_answers: {} } };
+      pages[pageId][component].student_answers[String(index)] = value;
+    } else {
+      pages[pageId] ??= { [component]: { student_answers: multiPage ? [] : {} } };
+      if (multiPage) pages[pageId][component].student_answers[0] = value;
+      else pages[pageId][component].student_answers[String(index)] = value;
+    }
   }
 
   const stateObj = {
@@ -1474,6 +1591,14 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
       return { status: 'needs_human', reason: '选择题会计分，API 自动提交默认关闭' };
     }
     return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+  }
+  const isSequence = category === 'sequence';
+  const isMulti = category === 'multichoice';
+  if (isSequence || isMulti) {
+    if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
+      return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+    }
+    return { status: 'needs_human', reason: '排序/多选题会计分，自动提交默认关闭' };
   }
 
   const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);

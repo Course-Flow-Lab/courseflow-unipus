@@ -652,6 +652,77 @@ ${context.trim()}
   }
   return out;
 }
+async function askAiForItems(session, prompt) {
+  let parsed = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await hostCall("cw.ai.generate", {
+      session,
+      prompt: attempt === 0 ? prompt : `${prompt}
+\u4E0A\u6B21\u8F93\u51FA\u4E0D\u662F\u5408\u6CD5 JSON\uFF1B\u8FD9\u6B21\u53EA\u8F93\u51FA JSON\u3002`
+    });
+    const raw = String(response?.text ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+    try {
+      parsed = JSON.parse(raw);
+      break;
+    } catch {
+    }
+  }
+  return Array.isArray(parsed) ? parsed : null;
+}
+function answerMapFromItems(items) {
+  if (!items) return null;
+  const out = {};
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const id = String(item.id ?? "");
+    const texts = Array.isArray(item.texts) ? item.texts.map(String) : Array.isArray(item.answers) ? item.answers.map(String) : [];
+    if (id) out[id] = texts;
+  }
+  return out;
+}
+async function solveSequenceQuestions(session, group, context = "") {
+  const questions = (group.questions ?? []).map((question, index) => ({
+    id: String(index),
+    stem: stripHtml(question?.content?.html)
+  }));
+  const options = (group.options ?? []).map((option) => ({
+    caption: String(option?.caption ?? ""),
+    text: stripHtml(option?.content?.html)
+  }));
+  if (questions.length === 0 || options.length === 0) return null;
+  const prompt = [
+    "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
+    "\u8FD9\u662F\u6392\u5E8F/\u5339\u914D\u9898\u3002\u9898\u76EE\u4E2D\u7684\u56FE\u7247\u6216\u7A7A\u683C\u6309\u987A\u5E8F\u5BF9\u5E94\u542C\u529B\u539F\u6587\u4E2D\u7684\u4EBA\u7269\u6216\u6BB5\u843D\u3002",
+    "\u8BF7\u6839\u636E\u539F\u6587\uFF0C\u628A\u6BCF\u4E2A\u9898\u76EE\u5339\u914D\u5230\u6B63\u786E\u9009\u9879\u3002",
+    '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["A"]}\uFF0Ctexts \u53EA\u653E\u4E00\u4E2A\u9009\u9879 caption\u3002',
+    context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
+${context.trim()}` : "",
+    `\u9009\u9879\uFF1A${JSON.stringify(options)}`,
+    JSON.stringify(questions)
+  ].join("\n");
+  return answerMapFromItems(await askAiForItems(session, prompt));
+}
+async function solveMultiChoiceQuestions(session, group, context = "") {
+  const questions = (group.questions ?? []).map((question, index) => ({
+    id: String(index),
+    stem: stripHtml(question?.content?.html),
+    options: (question?.options ?? []).map((option) => ({
+      caption: String(option?.caption ?? ""),
+      text: stripHtml(option?.content?.html)
+    }))
+  }));
+  if (questions.length === 0) return null;
+  const prompt = [
+    "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
+    "\u8FD9\u662F\u591A\u9009\u9898\uFF0C\u6BCF\u9053\u9898\u53EF\u80FD\u6709\u591A\u4E2A\u6B63\u786E\u9009\u9879\u3002",
+    "\u6839\u636E\u542C\u529B/\u89C6\u9891\u539F\u6587\u548C\u9898\u76EE\uFF0C\u9009\u51FA\u6240\u6709\u6B63\u786E\u9009\u9879\u3002",
+    '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["A","C"]}\u3002',
+    context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
+${context.trim()}` : "",
+    JSON.stringify(questions)
+  ].join("\n");
+  return answerMapFromItems(await askAiForItems(session, prompt));
+}
 function parseVtt(text) {
   const out = [];
   for (const raw of String(text).split(/\r?\n/)) {
@@ -1017,14 +1088,31 @@ async function studyChoiceBrowser(session, courseId, groupId, decoded, questionG
 async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, precomputedValues) {
   const category = String(questionGroup.category ?? "").toLowerCase();
   const isFill = /fillblank/.test(category);
-  const choice = isFill ? null : { group: questionGroup, category };
+  const isSequence = category === "sequence";
+  const isMulti = category === "multichoice";
+  const choice = !isFill && !isSequence && !isMulti ? { group: questionGroup, category } : null;
+  const questions = questionGroup.questions ?? [];
   let values = precomputedValues ?? [];
   if (isFill) {
     if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
       const solved = await solveTextQuestions(session, questionGroup);
       if (!solved) return { status: "needs_human", reason: "fillblankScoop \u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
-      values = (questionGroup.questions ?? []).map((_, index) => solved[String(index)]?.[0] ?? "");
+      values = questions.map((_, index) => solved[String(index)]?.[0] ?? "");
+    }
+  } else if (isSequence) {
+    if (values.length === 0) {
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveSequenceQuestions(session, questionGroup, context);
+      if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u6392\u5E8F\u9898\u7B54\u6848" };
+      values = questions.map((_, index) => solved[String(index)]?.[0] ?? "");
+    }
+  } else if (isMulti) {
+    if (values.length === 0) {
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveMultiChoiceQuestions(session, questionGroup, context);
+      if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u591A\u9009\u9898\u7B54\u6848" };
+      values = questions.map((_, index) => solved[String(index)] ?? []);
     }
   } else if (choice) {
     if (values.length === 0) {
@@ -1036,7 +1124,6 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
   } else {
     return { status: "needs_human", reason: `\u672A\u652F\u6301\u7684\u5BA2\u89C2\u9898\u7C7B\u578B ${category || "unknown"}` };
   }
-  const questions = questionGroup.questions ?? [];
   if (values.length === 0) return { status: "needs_human", reason: "\u6CA1\u6709\u6784\u9020\u51FA\u7B54\u6848" };
   const userState = await fetchUserState(session, courseId, groupId, auth);
   const version = String(
@@ -1053,12 +1140,15 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
     const pageId = String(path[1] ?? "p_1");
     const meta = pageMeta(indexMap, pageId);
     const qid = meta.qid ?? firstQid;
+    const defaultRule = isFill ? "in" : isSequence ? "eq_ig_case" : isMulti ? "contain" : "eq";
     const rule = String(
-      (Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules) ?? (isFill ? "in" : "eq")
+      (Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules) ?? defaultRule
     );
-    const value = values[index] ?? "";
-    const answerIndex = multiPage ? 0 : index;
-    const offset = multiPage ? index : 0;
+    const rawValue = values[index];
+    const value = isMulti ? Array.isArray(rawValue) ? rawValue.map(String) : rawValue ? [String(rawValue)] : [] : String(rawValue ?? "");
+    const slicedPage = multiPage && !isSequence && !isMulti;
+    const answerIndex = slicedPage ? 0 : index;
+    const offset = slicedPage ? index : 0;
     answerList[String(index)] = {
       student_answer: value,
       isDone: true,
@@ -1080,10 +1170,18 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
       }
     };
     const existingComponent = userState?.state?.[pageId] ? Object.keys(userState.state[pageId])[0] : "";
-    const component = existingComponent || "c_1_1";
-    pages[pageId] ??= { [component]: { student_answers: multiPage ? [] : {} } };
-    if (multiPage) pages[pageId][component].student_answers[0] = value;
-    else pages[pageId][component].student_answers[String(index)] = value;
+    const component = existingComponent || (isSequence ? "c_1_0" : "c_1_1");
+    if (isMulti) {
+      pages[pageId] ??= { [component]: { student_answers: [] } };
+      pages[pageId][component].student_answers[index] = value;
+    } else if (isSequence) {
+      pages[pageId] ??= { [component]: { student_answers: {} } };
+      pages[pageId][component].student_answers[String(index)] = value;
+    } else {
+      pages[pageId] ??= { [component]: { student_answers: multiPage ? [] : {} } };
+      if (multiPage) pages[pageId][component].student_answers[0] = value;
+      else pages[pageId][component].student_answers[String(index)] = value;
+    }
   }
   const stateObj = {
     version,
@@ -1307,6 +1405,14 @@ async function studyTask(session, courseId, unit, auth) {
       return { status: "needs_human", reason: "\u9009\u62E9\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
     }
     return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+  }
+  const isSequence = category === "sequence";
+  const isMulti = category === "multichoice";
+  if (isSequence || isMulti) {
+    if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
+      return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+    }
+    return { status: "needs_human", reason: "\u6392\u5E8F/\u591A\u9009\u9898\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
   }
   const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
   if (objective && SETTINGS.enable_task_submit !== true) {

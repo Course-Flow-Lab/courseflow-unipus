@@ -11,7 +11,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 课程目录页解析 `course_v1` 课程 ID
 - 课程树 + 每个 Unit 的 `course_progress`，映射成阅读/视频/题组单元
 
-现在已跑通单页和多页客观题的完整链路：
+现在已跑通单页、多页、排序/匹配和多选客观题的完整链路：
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
 - 题组提交：`POST /course/api/v3/submit/<course>/<group>/`，真实 envelope 已对齐
@@ -117,6 +117,51 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 实测 `u8g514`（Short conversations，5 页）：**100 分**。
 
+### 排序 / 匹配题 `sequence`
+
+排序题在接口里不是数组，而是对象：
+
+```json
+"p_1": {
+  "c_1_0": {
+    "student_answers": {
+      "0": "D",
+      "1": "E",
+      "2": "G"
+    }
+  }
+}
+```
+
+- `rule` 是 `eq_ig_case`
+- `answerList` 仍用全局 `0..N`
+- `answers[i].user_answer.answer.answer` 是单个选项 caption
+- 题目图片按顺序对应原文中的人物/段落，模块会把 VTT/听力原文一起交给模型
+
+实测 `u3g565`（8 个匹配项）：**100 分**。
+
+### 多选题 `multichoice`
+
+多选题每题的答案是数组，整个 `student_answers` 是数组的数组：
+
+```json
+"p_1": {
+  "c_1_1": {
+    "student_answers": [
+      ["A", "B"],
+      ["C"],
+      ["D"]
+    ]
+  }
+}
+```
+
+- `rule` 是 `contain`
+- `answerList[i].student_answer` 是数组
+- `answers[i].user_answer.answer.answer` 也是数组
+
+`u4g624` 的本地状态结构已通过页面 `saveAnswer` 验证；但它是 required 任务，而且音频没有 `script`/VTT，尚未做真实提交，避免首次得分锁成 0。
+
 ## Playwright 浏览器提交（已验证）
 
 用 Edge 远程调试（`--remote-debugging-port=9222`）+ Playwright `connectOverCDP`，通过模块的 `cw.browser` 已完成：
@@ -130,6 +175,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - u3g192（singlechoice，2 题）：100 分
 - u8g514（Short conversations，多页 5 题）：100 分
 - u4g250（Short conversations，多页 5 题，required）：100 分
+- u3g565（sequence，8 个匹配项）：100 分
 
 流程：
 
@@ -154,7 +200,8 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 写入有频率限制（`600001/600002 操作过于频繁`），模块返回 `in_progress`，需要等几分钟再继续。
 - 题组有开放时间：`flowStrategy.startTime` 未到时平台会提示“学习开始时间未到，不能提交”；模块在打开浏览器前直接返回 `blocked`，不会白白消耗首次得分。
 - 首次得分锁定：`record_every_submit=false`、`record_max_submit=false`，第一次提交必须用正确答案。
-- 多页题组已支持 API 自动提交；浏览器路径仍只用于单页题组。
+- 多页题组、排序题、多选题都走 API 自动提交；浏览器路径仍只用于单页单选/填空。
+- 多选题如果既没有 `audio.script` 也没有 VTT（例如 `u4g624`），模型只能靠题目和选项猜，正确率无法保证；这类题建议先补音频转写或人工答案。
 
 ## 安装
 
