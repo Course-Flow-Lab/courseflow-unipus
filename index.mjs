@@ -161,8 +161,16 @@ function authBegin(params) {
     }
   };
 }
-async function liveLogin(session, username, password) {
-  if (!SCHOOL_ID) throw new Error("\u6A21\u5757\u8BBE\u7F6E\u7F3A\u5C11 school_id\uFF08\u6216\u5728 class_url \u4E2D\u5E26\u4E0A\uFF09");
+async function kickOtherSession(session) {
+  try {
+    log("warn", "single-session conflict, logging out the other session");
+    await follow(session, `${UNIPUS_BASE}/logout?school_id=${encodeURIComponent(SCHOOL_ID)}&repeatLogin=1`, 6);
+    await follow(session, `${UNIPUS_BASE}/user/comm/login?school_id=`, 4);
+  } catch (error) {
+    log("warn", `logout other session failed: ${errorText(error)}`);
+  }
+}
+async function casLogin(session, username, password) {
   const service = `${UNIPUS_BASE}/user/student?school_id=${encodeURIComponent(SCHOOL_ID)}`;
   const loginPage = `${SSO_BASE}/sso/login?service=${encodeURIComponent(service)}`;
   const fetcher = hostFetchFor(session);
@@ -202,44 +210,58 @@ async function liveLogin(session, username, password) {
   const ticket = login.rs?.serviceTicket;
   const openId = login.rs?.openid;
   if (!ticket) throw new Error("SSO \u672A\u8FD4\u56DE serviceTicket");
-  const redeem = `${service}${service.includes("?") ? "&" : "?"}ticket=${encodeURIComponent(ticket)}`;
-  await follow(session, redeem, 8);
-  const tokenResponse = await fetcher(`${UNIPUS_BASE}/user/data/getToken`, {
-    headers: { ...BROWSER_HEADERS, accept: "application/json, text/plain, */*", referer: service }
-  });
-  if (tokenResponse.status === 302 || !tokenResponse.ok) {
-    throw {
-      code: "platform_session_conflict",
-      message: "\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u8BBE\u5907/\u6D4F\u89C8\u5668\u767B\u5F55\uFF0C\u8BF7\u5148\u5728\u5B98\u65B9\u9875\u9762\u9000\u51FA\u540E\u91CD\u8BD5"
-    };
-  }
-  let tokenJson;
-  try {
-    tokenJson = JSON.parse(tokenResponse.body);
-  } catch {
-    throw new Error(`getToken \u8FD4\u56DE\u975E JSON\uFF08HTTP ${tokenResponse.status}\uFF09`);
-  }
-  const token = tokenJson.token ?? tokenJson.data?.token;
-  const resolvedOpenId = tokenJson.openId ?? tokenJson.data?.openId ?? openId;
-  if (!token) throw new Error("getToken \u672A\u8FD4\u56DE token");
-  if (CLASS_ID && DB_COURSE_ID) {
-    try {
-      await fetcher(
-        `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
-        {
-          headers: {
-            ...BROWSER_HEADERS,
-            accept: "text/html, */*; q=0.01",
-            referer: service,
-            "x-requested-with": "XMLHttpRequest"
-          }
-        }
-      );
-    } catch (error) {
-      log("warn", `automaticJoinClass failed: ${errorText(error)}`);
+  return { service, ticket, openId, fetcher };
+}
+async function liveLogin(session, username, password) {
+  if (!SCHOOL_ID) throw new Error("\u6A21\u5757\u8BBE\u7F6E\u7F3A\u5C11 school_id\uFF08\u6216\u5728 class_url \u4E2D\u5E26\u4E0A\uFF09");
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0) await kickOtherSession(session);
+    const { service, ticket, openId, fetcher } = await casLogin(session, username, password);
+    const redeem = `${service}${service.includes("?") ? "&" : "?"}ticket=${encodeURIComponent(ticket)}`;
+    await follow(session, redeem, 8);
+    const tokenResponse = await fetcher(`${UNIPUS_BASE}/user/data/getToken`, {
+      headers: { ...BROWSER_HEADERS, accept: "application/json, text/plain, */*", referer: service }
+    });
+    if (tokenResponse.status === 302 || !tokenResponse.ok) {
+      lastError = {
+        code: "platform_session_conflict",
+        message: "\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u8BBE\u5907/\u6D4F\u89C8\u5668\u767B\u5F55\uFF0C\u81EA\u52A8\u9000\u51FA\u540E\u4ECD\u65E0\u6CD5\u767B\u5F55"
+      };
+      continue;
     }
+    let tokenJson;
+    try {
+      tokenJson = JSON.parse(tokenResponse.body);
+    } catch {
+      throw new Error(`getToken \u8FD4\u56DE\u975E JSON\uFF08HTTP ${tokenResponse.status}\uFF09`);
+    }
+    const token = tokenJson.token ?? tokenJson.data?.token;
+    const resolvedOpenId = tokenJson.openId ?? tokenJson.data?.openId ?? openId;
+    if (!token) {
+      lastError = { code: "platform_session_conflict", message: "getToken \u672A\u8FD4\u56DE token" };
+      continue;
+    }
+    if (CLASS_ID && DB_COURSE_ID) {
+      try {
+        await fetcher(
+          `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
+          {
+            headers: {
+              ...BROWSER_HEADERS,
+              accept: "text/html, */*; q=0.01",
+              referer: service,
+              "x-requested-with": "XMLHttpRequest"
+            }
+          }
+        );
+      } catch (error) {
+        log("warn", `automaticJoinClass failed: ${errorText(error)}`);
+      }
+    }
+    return { token: String(token), openId: String(resolvedOpenId ?? ""), displayName: username };
   }
-  return { token: String(token), openId: String(resolvedOpenId ?? ""), displayName: username };
+  throw lastError ?? { code: "platform_session_conflict", message: "\u767B\u5F55\u5931\u8D25" };
 }
 async function authSubmit(params) {
   const id = String(params.challenge ?? "");
@@ -524,7 +546,7 @@ async function studyLeaf(session, courseId, unit, auth) {
   } catch {
   }
   const response = await hostFetchFor(session, "save_study")(
-    `${UCONTENT_BASE}/api/mobile/user_group/${courseId}/${groupId}/progress/v2/`,
+    `${UCONTENT_BASE}/api/mobile/user_group/${courseId}/${groupId}/progress/`,
     {
       method: "POST",
       headers: {
@@ -534,7 +556,12 @@ async function studyLeaf(session, courseId, unit, auth) {
         origin: UCONTENT_BASE,
         referer: `${UCONTENT_BASE}/_pc_default/pc.html`
       },
-      body: JSON.stringify({ score: {}, version })
+      body: JSON.stringify({
+        status: 1,
+        rid: `flowengine:studyStatus:1:${groupId}`,
+        groupId,
+        version: "default"
+      })
     }
   );
   let payload = null;

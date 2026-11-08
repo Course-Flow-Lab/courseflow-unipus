@@ -198,8 +198,17 @@ function authBegin(params: any) {
   };
 }
 
-async function liveLogin(session: string, username: string, password: string) {
-  if (!SCHOOL_ID) throw new Error('模块设置缺少 school_id（或在 class_url 中带上）');
+async function kickOtherSession(session: string): Promise<void> {
+  try {
+    log('warn', 'single-session conflict, logging out the other session');
+    await follow(session, `${UNIPUS_BASE}/logout?school_id=${encodeURIComponent(SCHOOL_ID)}&repeatLogin=1`, 6);
+    await follow(session, `${UNIPUS_BASE}/user/comm/login?school_id=`, 4);
+  } catch (error) {
+    log('warn', `logout other session failed: ${errorText(error)}`);
+  }
+}
+
+async function casLogin(session: string, username: string, password: string) {
   const service = `${UNIPUS_BASE}/user/student?school_id=${encodeURIComponent(SCHOOL_ID)}`;
   const loginPage = `${SSO_BASE}/sso/login?service=${encodeURIComponent(service)}`;
   const fetcher = hostFetchFor(session);
@@ -241,46 +250,60 @@ async function liveLogin(session: string, username: string, password: string) {
   const ticket = login.rs?.serviceTicket;
   const openId = login.rs?.openid;
   if (!ticket) throw new Error('SSO 未返回 serviceTicket');
+  return { service, ticket, openId, fetcher };
+}
 
-  const redeem = `${service}${service.includes('?') ? '&' : '?'}ticket=${encodeURIComponent(ticket)}`;
-  await follow(session, redeem, 8);
+async function liveLogin(session: string, username: string, password: string) {
+  if (!SCHOOL_ID) throw new Error('模块设置缺少 school_id（或在 class_url 中带上）');
+  let lastError: any = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0) await kickOtherSession(session);
+    const { service, ticket, openId, fetcher } = await casLogin(session, username, password);
+    const redeem = `${service}${service.includes('?') ? '&' : '?'}ticket=${encodeURIComponent(ticket)}`;
+    await follow(session, redeem, 8);
 
-  const tokenResponse = await fetcher(`${UNIPUS_BASE}/user/data/getToken`, {
-    headers: { ...BROWSER_HEADERS, accept: 'application/json, text/plain, */*', referer: service },
-  });
-  if (tokenResponse.status === 302 || !tokenResponse.ok) {
-    throw {
-      code: 'platform_session_conflict',
-      message: '账号已在其他设备/浏览器登录，请先在官方页面退出后重试',
-    };
-  }
-  let tokenJson: any;
-  try {
-    tokenJson = JSON.parse(tokenResponse.body);
-  } catch {
-    throw new Error(`getToken 返回非 JSON（HTTP ${tokenResponse.status}）`);
-  }
-  const token = tokenJson.token ?? tokenJson.data?.token;
-  const resolvedOpenId = tokenJson.openId ?? tokenJson.data?.openId ?? openId;
-  if (!token) throw new Error('getToken 未返回 token');
-  if (CLASS_ID && DB_COURSE_ID) {
-    try {
-      await fetcher(
-        `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
-        {
-          headers: {
-            ...BROWSER_HEADERS,
-            accept: 'text/html, */*; q=0.01',
-            referer: service,
-            'x-requested-with': 'XMLHttpRequest',
-          },
-        },
-      );
-    } catch (error) {
-      log('warn', `automaticJoinClass failed: ${errorText(error)}`);
+    const tokenResponse = await fetcher(`${UNIPUS_BASE}/user/data/getToken`, {
+      headers: { ...BROWSER_HEADERS, accept: 'application/json, text/plain, */*', referer: service },
+    });
+    if (tokenResponse.status === 302 || !tokenResponse.ok) {
+      lastError = {
+        code: 'platform_session_conflict',
+        message: '账号已在其他设备/浏览器登录，自动退出后仍无法登录',
+      };
+      continue;
     }
+    let tokenJson: any;
+    try {
+      tokenJson = JSON.parse(tokenResponse.body);
+    } catch {
+      throw new Error(`getToken 返回非 JSON（HTTP ${tokenResponse.status}）`);
+    }
+    const token = tokenJson.token ?? tokenJson.data?.token;
+    const resolvedOpenId = tokenJson.openId ?? tokenJson.data?.openId ?? openId;
+    if (!token) {
+      lastError = { code: 'platform_session_conflict', message: 'getToken 未返回 token' };
+      continue;
+    }
+    if (CLASS_ID && DB_COURSE_ID) {
+      try {
+        await fetcher(
+          `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
+          {
+            headers: {
+              ...BROWSER_HEADERS,
+              accept: 'text/html, */*; q=0.01',
+              referer: service,
+              'x-requested-with': 'XMLHttpRequest',
+            },
+          },
+        );
+      } catch (error) {
+        log('warn', `automaticJoinClass failed: ${errorText(error)}`);
+      }
+    }
+    return { token: String(token), openId: String(resolvedOpenId ?? ''), displayName: username };
   }
-  return { token: String(token), openId: String(resolvedOpenId ?? ''), displayName: username };
+  throw lastError ?? { code: 'platform_session_conflict', message: '登录失败' };
 }
 
 async function authSubmit(params: any) {
@@ -600,7 +623,7 @@ async function studyLeaf(session: string, courseId: string, unit: any, auth: any
     // fall back to default
   }
   const response = await hostFetchFor(session, 'save_study')(
-    `${UCONTENT_BASE}/api/mobile/user_group/${courseId}/${groupId}/progress/v2/`,
+    `${UCONTENT_BASE}/api/mobile/user_group/${courseId}/${groupId}/progress/`,
     {
       method: 'POST',
       headers: {
@@ -610,7 +633,12 @@ async function studyLeaf(session: string, courseId: string, unit: any, auth: any
         origin: UCONTENT_BASE,
         referer: `${UCONTENT_BASE}/_pc_default/pc.html`,
       },
-      body: JSON.stringify({ score: {}, version }),
+      body: JSON.stringify({
+        status: 1,
+        rid: `flowengine:studyStatus:1:${groupId}`,
+        groupId,
+        version: 'default',
+      }),
     },
   );
   let payload: any = null;
