@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "unipus_classic",
+  "name": "U校园普通版",
+  "version": "0.1.0",
+  "moduleApi": 1,
+  "engines": { "framework": ">=0.1.1 <0.2.0" },
+  "runtime": { "engine": "node", "entry": "index.mjs", "files": [] },
+  "platform": {
+    "id": "unipus_classic",
+    "name": "U校园普通版",
+    "short": "U校园普通版",
+    "login": ["password"],
+    "operations": ["study"],
+    "unit_kinds": ["video", "reading", "document"],
+    "presentation": {
+      "tabs": [
+        { "id": "study", "label": "学习目录" }
+      ],
+      "actions": []
+    }
+  },
+  "permissions": {
+    "network": ["unipus.cn", "*.unipus.cn"],
+    "browser": true,
+    "ai": true,
+    "storage": "module"
+  }
+}

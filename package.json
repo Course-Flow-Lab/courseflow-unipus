@@ -1,0 +1,15 @@
+{
+  "name": "courseflow-unipus-classic",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Courseflow U校园普通版模块",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "esbuild src/module.ts --bundle --platform=node --format=esm --outfile=index.mjs --external:node:*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
