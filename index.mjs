@@ -509,21 +509,6 @@ function collectQids(indexMap) {
   walk(indexMap);
   return out;
 }
-function taskAnswers(decoded) {
-  if (!decoded || typeof decoded !== "object") return [];
-  const out = [];
-  for (const group of Object.values(decoded)) {
-    for (const question of group?.questions ?? []) {
-      const analysis = stripHtml(question?.analysis?.html);
-      if (analysis) out.push(analysis);
-    }
-    if (out.length === 0) {
-      const analysis = stripHtml(group?.analysis?.html);
-      if (analysis) out.push(analysis);
-    }
-  }
-  return out;
-}
 async function groupState(session, courseId, groupId, auth) {
   const { text } = await fetchText(
     session,
@@ -597,7 +582,93 @@ async function studyLeaf(session, courseId, unit, auth) {
     checkpoint: { phase: "submitted" }
   };
 }
+async function fetchUserState(session, courseId, groupId, auth) {
+  const { text } = await fetchText(
+    session,
+    `${UCONTENT_BASE}/api/mobile/user_module/${courseId}/${groupId}/`,
+    annotatorHeaders(auth)
+  );
+  try {
+    return JSON.parse(text)?.data ?? null;
+  } catch {
+    return null;
+  }
+}
+function decryptSubmitContent(payload) {
+  const encrypted = payload?.content;
+  const keySalt = payload?.k;
+  if (typeof encrypted !== "string" || !encrypted.startsWith("unipus.") || !keySalt) return null;
+  const key = Buffer.from(`${CONTENT_KEY_PREFIX}${keySalt}`, "utf8");
+  const decipher = createDecipheriv("aes-128-ecb", key, null);
+  decipher.setAutoPadding(false);
+  const text = Buffer.concat([
+    decipher.update(Buffer.from(encrypted.slice("unipus.".length), "hex")),
+    decipher.final()
+  ]).toString("utf8").replace(/\u0000+$/g, "");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+function findChoiceGroup(decoded) {
+  if (!decoded || typeof decoded !== "object") return null;
+  for (const value of Object.values(decoded)) {
+    if (!value || !Array.isArray(value.questions)) continue;
+    const category = String(value.category ?? "");
+    if (category === "singlechoice" || category === "truefalse" || category === "choice") {
+      return { group: value, category };
+    }
+  }
+  return null;
+}
+async function solveChoiceQuestions(session, group) {
+  const questions = (group.questions ?? []).map((question, index) => ({
+    id: String(index),
+    stem: stripHtml(question?.content?.html),
+    options: (question?.options ?? []).map((option) => ({
+      caption: String(option?.caption ?? ""),
+      text: stripHtml(option?.content?.html)
+    }))
+  }));
+  if (questions.length === 0) return null;
+  const prompt = [
+    "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
+    '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
+    "\u9009\u62E9\u9898 texts \u8FD4\u56DE\u6B63\u786E\u9009\u9879\u7684 caption\uFF08A/B/C/D\uFF09\uFF0C\u5982\u679C\u4E0D\u786E\u5B9A caption\uFF0C\u8FD4\u56DE\u9009\u9879\u539F\u6587\u3002",
+    JSON.stringify(questions)
+  ].join("\n");
+  let parsed = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await hostCall("cw.ai.generate", {
+      session,
+      prompt: attempt === 0 ? prompt : `${prompt}
+\u4E0A\u6B21\u8F93\u51FA\u4E0D\u662F\u5408\u6CD5 JSON\uFF1B\u8FD9\u6B21\u53EA\u8F93\u51FA JSON\u3002`
+    });
+    const raw = String(response?.text ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+    try {
+      parsed = JSON.parse(raw);
+      break;
+    } catch {
+    }
+  }
+  if (!Array.isArray(parsed)) return null;
+  const out = {};
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    const id = String(item.id ?? "");
+    const texts = Array.isArray(item.texts) ? item.texts.map(String) : Array.isArray(item.answers) ? item.answers.map(String) : [];
+    if (id) out[id] = texts;
+  }
+  return out;
+}
 async function studyTask(session, courseId, unit, auth) {
+  if (SETTINGS.enable_task_submit !== true) {
+    return {
+      status: "needs_human",
+      reason: "\u9898\u7EC4\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED\uFF08\u63D0\u4EA4\u7ED3\u6784\u4ECD\u5728\u8054\u8C03\uFF0C\u907F\u514D\u5199\u5165 0 \u5206\u5C1D\u8BD5\uFF09"
+    };
+  }
   const groupId = String(unit.id ?? "").split("::")[0];
   const summary = await fetchText(
     session,
@@ -609,7 +680,9 @@ async function studyTask(session, courseId, unit, auth) {
     summaryJson = JSON.parse(summary.text);
   } catch {
   }
-  const qids = collectQids(summaryJson?.summary?.indexMap);
+  const indexMap = summaryJson?.summary?.indexMap ?? {};
+  const questionsList = summaryJson?.summary?.questionsList ?? [];
+  const qids = collectQids(indexMap);
   if (qids.length === 0) {
     return { status: "needs_human", reason: "\u9898\u7EC4\u6CA1\u6709\u8FD4\u56DE qid" };
   }
@@ -624,14 +697,100 @@ async function studyTask(session, courseId, unit, auth) {
   } catch {
   }
   const decoded = decodeContent(contentJson);
-  const answers = taskAnswers(decoded);
-  if (answers.length === 0) {
-    return { status: "needs_human", reason: "\u9898\u7EC4\u5185\u5BB9\u6CA1\u6709\u53EF\u7528\u7684\u53C2\u8003\u7B54\u6848" };
+  const choice = findChoiceGroup(decoded);
+  if (!choice) {
+    return { status: "needs_human", reason: "\u5F53\u524D\u9898\u578B\u5C1A\u672A\u652F\u6301\u81EA\u52A8\u63D0\u4EA4\uFF08\u4EC5\u652F\u6301\u5355\u9009/\u5224\u65AD\uFF09" };
+  }
+  const solved = await solveChoiceQuestions(session, choice.group);
+  if (!solved) {
+    return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
+  }
+  const userState = await fetchUserState(session, courseId, groupId, auth);
+  const answers = {};
+  const specificScores = [];
+  const questions = choice.group.questions ?? [];
+  for (let index = 0; index < questions.length; index += 1) {
+    const question = questions[index];
+    const path = questionsList[index]?.path?.[0] ?? [];
+    const pageId = String(path[1] ?? "");
+    const pageInfo = indexMap[pageId] ?? {};
+    const qid = pageInfo.qid;
+    const rules = pageInfo.rules ?? [];
+    const options = question.options ?? [];
+    const texts = solved[String(index)] ?? [];
+    let optionIndex = options.findIndex((option2) => {
+      const caption = String(option2?.caption ?? "");
+      const text = stripHtml(option2?.content?.html);
+      return texts.some((value) => value === caption || value === text || text.includes(value) || value.includes(text));
+    });
+    if (optionIndex < 0) optionIndex = 0;
+    const option = options[optionIndex] ?? {};
+    if (qid) {
+      answers[String(index)] = {
+        user_answer: {
+          qid,
+          rule: rules,
+          answer: {
+            index: optionIndex,
+            answer: String(option.caption ?? "A")
+          },
+          content: ""
+        }
+      };
+    } else {
+      answers[String(index)] = { score: 0 };
+    }
+    specificScores[index] = null;
+  }
+  const payload = {
+    enable_mistake: false,
+    version: "default",
+    record_version: String(userState?.state?.version ?? "default"),
+    base: String(userState?.base ?? ""),
+    state: JSON.stringify(userState?.state ?? {}),
+    specific_scores: specificScores,
+    answers
+  };
+  const submit = await hostFetchFor(session, "save_study")(
+    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
+    {
+      method: "POST",
+      headers: {
+        ...BROWSER_HEADERS,
+        ...annotatorHeaders(auth),
+        "content-type": "application/json",
+        origin: UCONTENT_BASE,
+        referer: `${UCONTENT_BASE}/_pc_default/pc.html`
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+  let submitJson = null;
+  try {
+    submitJson = JSON.parse(submit.body);
+  } catch {
+  }
+  log("info", `submit ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? "?"}`);
+  if (submitJson?.code !== 0) {
+    return {
+      status: "needs_human",
+      reason: `\u9898\u7EC4\u63D0\u4EA4\u5931\u8D25\uFF1Acode ${submitJson?.code ?? "?"} ${submitJson?.message ?? submit.body.slice(0, 160)}`
+    };
+  }
+  const result = decryptSubmitContent(submitJson?.data?.content);
+  const state = Number(result?.submit_info?.state?.state ?? 0);
+  const score = result?.submit_info?.score ?? result?.submit_info?.state?.score ?? null;
+  if (state === 1) {
+    return {
+      status: "completed",
+      evidence: { platform_confirmed: true, score },
+      checkpoint: { phase: "done" }
+    };
   }
   return {
     status: "needs_human",
-    reason: `\u666E\u901A\u7248\u63D0\u4EA4\u63A5\u53E3\u5C1A\u672A\u8054\u8C03\uFF0C\u5DF2\u8BFB\u53D6 ${qids.length} \u4E2A qid / ${answers.length} \u6761\u53C2\u8003\u7B54\u6848`,
-    evidence: { qids, answers: answers.slice(0, 10) }
+    reason: `\u9898\u7EC4\u5DF2\u63D0\u4EA4\u4F46\u5E73\u53F0\u672A\u786E\u8BA4\u5B8C\u6210\uFF08score ${score ?? "?"}\uFF09`,
+    evidence: { score }
   };
 }
 async function studyStep(params) {

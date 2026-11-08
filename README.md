@@ -14,8 +14,24 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 联调中：
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
-- 题组提交：`/course/api/v3/submit` 的题型 payload 还未逐类验证
-- 阅读/视频完成：`/api/mobile/user_group/.../progress/v2` 需要带课程发布版本（课程树的 `publish_version`），字段已接上，等待风控冷却后验证
+- 题组提交：已抓到真实 envelope：
+  ```json
+  {
+    "enable_mistake": false,
+    "version": "default",
+    "record_version": "<user_module.state.version>",
+    "base": "<user_module.commit>",
+    "state": "<JSON 字符串>",
+    "specific_scores": [null, null],
+    "answers": { "0": { "score": 0 } }
+  }
+  ```
+  空答案提交可以成功；带 `user_answer` 的答案结构还在验证，默认关闭自动提交（`enable_task_submit: true` 才启用）。
+
+已确认可用：
+
+- 阅读/视频：`POST /api/mobile/user_group/<course>/<group>/progress/`，body
+  `{"status":1,"rid":"flowengine:studyStatus:1:<group>","groupId":"<group>","version":"default"}`
 
 ## 已知限制
 
