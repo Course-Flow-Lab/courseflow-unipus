@@ -954,6 +954,13 @@ function browserStudyTask(mode: string, values: string[]) {
   })();
 }
 
+function isSinglePageTask(questionsList: any[]): boolean {
+  const pages = new Set(
+    (questionsList ?? []).map((item: any) => String(item?.path?.[0]?.[1] ?? '')),
+  );
+  return pages.size <= 1;
+}
+
 function coursewareUrl(courseId: string, groupId: string, questionsList: any[]) {
   const parentPath = questionsList?.[0]?.path?.[1] ?? [];
   const coursewarePath = [...parentPath, groupId];
@@ -970,7 +977,12 @@ async function browserStudy(
   auth: any,
   minScorePct: number,
 ) {
-  const opened = await hostCall('cw.browser.open', { session, url, purpose: 'study' });
+  let opened: any = null;
+  try {
+    opened = await hostCall('cw.browser.open', { session, url, purpose: 'study' });
+  } catch (error) {
+    return { status: 'needs_human', reason: `官方浏览器不可用：${errorText(error)}` };
+  }
   const page = opened?.page;
   if (!page) return { status: 'needs_human', reason: '官方浏览器没有返回页面句柄' };
   let result: any = null;
@@ -984,6 +996,9 @@ async function browserStudy(
     });
     log('info', `browser ${mode} ${groupId}: ${JSON.stringify(result).slice(0, 200)}`);
     await new Promise((resolve) => setTimeout(resolve, 4000));
+  } catch (error) {
+    result = { error: errorText(error) };
+    log('warn', `browser ${mode} ${groupId} failed: ${errorText(error)}`);
   } finally {
     await hostCall('cw.browser.close', { session, page }).catch(() => {});
   }
@@ -1027,7 +1042,7 @@ async function studyFillblankBrowser(
   if (answers.length === 0) {
     return { status: 'needs_human', reason: '填空题没有答案来源' };
   }
-  return browserStudy(
+  const result = await browserStudy(
     session,
     courseId,
     groupId,
@@ -1037,6 +1052,10 @@ async function studyFillblankBrowser(
     auth,
     minScorePct,
   );
+  return {
+    ...result,
+    evidence: { ...(result as any).evidence, fill_answers: answers },
+  };
 }
 
 function matchChoiceCaption(options: any[], texts: string[]): string {
@@ -1086,7 +1105,7 @@ async function studyChoiceBrowser(
   const solved = await solveChoiceQuestions(session, choice.group);
   if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
   const captions = choiceCaptions(choice.group, solved);
-  return browserStudy(
+  const result = await browserStudy(
     session,
     courseId,
     groupId,
@@ -1096,6 +1115,10 @@ async function studyChoiceBrowser(
     auth,
     minScorePct,
   );
+  return {
+    ...result,
+    evidence: { ...(result as any).evidence, choice_answers: captions },
+  };
 }
 
 async function studyObjectiveApi(
@@ -1108,22 +1131,28 @@ async function studyObjectiveApi(
   indexMap: any,
   auth: any,
   minScorePct: number,
+  precomputedValues?: string[],
 ) {
+  if (!isSinglePageTask(questionsList)) {
+    return { status: 'needs_human', reason: '多页题组暂不支持 API 提交' };
+  }
   const category = String(questionGroup.category ?? '').toLowerCase();
   const isFill = /fillblank/.test(category);
   const choice = isFill ? null : findChoiceGroup(decoded);
-  let values: string[] = [];
+  let values: string[] = precomputedValues ?? [];
   if (isFill) {
-    values = scriptAnswers(decoded);
+    if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
       const solved = await solveTextQuestions(session, questionGroup);
       if (!solved) return { status: 'needs_human', reason: 'fillblankScoop 没有答案来源' };
       values = (questionGroup.questions ?? []).map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
     }
   } else if (choice) {
-    const solved = await solveChoiceQuestions(session, choice.group);
-    if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
-    values = choiceCaptions(choice.group, solved);
+    if (values.length === 0) {
+      const solved = await solveChoiceQuestions(session, choice.group);
+      if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
+      values = choiceCaptions(choice.group, solved);
+    }
   } else {
     return { status: 'needs_human', reason: `未支持的客观题类型 ${category || 'unknown'}` };
   }
@@ -1308,7 +1337,24 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
   const isChoice = category === 'singlechoice' || category === 'truefalse' || category === 'true_false' || category === 'choice';
   if (isFill) {
     if (BROWSER_STUDY) {
-      return studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct);
+      const browserResult: any = await studyFillblankBrowser(
+        session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
+      );
+      if (browserResult.status === 'completed') return browserResult;
+      const rawState = browserResult?.evidence?.state;
+      if (!(rawState === undefined || rawState === null || Number(rawState) === 0)) return browserResult;
+      if (!isSinglePageTask(questionsList)) {
+        return { ...browserResult, reason: `${browserResult.reason}；多页题组暂不支持 API 兜底` };
+      }
+      log('warn', `browser did not submit ${groupId}, falling back to API`);
+      const apiResult = await studyObjectiveApi(
+        session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct,
+        browserResult?.evidence?.fill_answers,
+      );
+      if (apiResult.status === 'completed') {
+        return { ...apiResult, evidence: { ...(apiResult as any).evidence, fallback: 'browser_to_api' } };
+      }
+      return apiResult;
     }
     if (SETTINGS.enable_task_submit !== true) {
       return { status: 'needs_human', reason: '填空题会计分，API 自动提交默认关闭' };
@@ -1317,7 +1363,24 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
   }
   if (isChoice) {
     if (BROWSER_STUDY) {
-      return studyChoiceBrowser(session, courseId, groupId, decoded, questionsList, auth, minScorePct);
+      const browserResult: any = await studyChoiceBrowser(
+        session, courseId, groupId, decoded, questionsList, auth, minScorePct,
+      );
+      if (browserResult.status === 'completed') return browserResult;
+      const rawState = browserResult?.evidence?.state;
+      if (!(rawState === undefined || rawState === null || Number(rawState) === 0)) return browserResult;
+      if (!isSinglePageTask(questionsList)) {
+        return { ...browserResult, reason: `${browserResult.reason}；多页题组暂不支持 API 兜底` };
+      }
+      log('warn', `browser did not submit ${groupId}, falling back to API`);
+      const apiResult = await studyObjectiveApi(
+        session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct,
+        browserResult?.evidence?.choice_answers,
+      );
+      if (apiResult.status === 'completed') {
+        return { ...apiResult, evidence: { ...(apiResult as any).evidence, fallback: 'browser_to_api' } };
+      }
+      return apiResult;
     }
     if (SETTINGS.enable_task_submit !== true) {
       return { status: 'needs_human', reason: '选择题会计分，API 自动提交默认关闭' };

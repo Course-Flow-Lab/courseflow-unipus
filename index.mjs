@@ -816,13 +816,24 @@ function browserStudyTask(mode, values) {
     return { mode, inputs: inputs.length, filled: inputs.filter((i) => i.value).length, ...result };
   })();
 }
+function isSinglePageTask(questionsList) {
+  const pages = new Set(
+    (questionsList ?? []).map((item) => String(item?.path?.[0]?.[1] ?? ""))
+  );
+  return pages.size <= 1;
+}
 function coursewareUrl(courseId, groupId, questionsList) {
   const parentPath = questionsList?.[0]?.path?.[1] ?? [];
   const coursewarePath = [...parentPath, groupId];
   return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}#/${courseId}/courseware/${coursewarePath.join("/")}/p_1`;
 }
 async function browserStudy(session, courseId, groupId, url, mode, values, auth, minScorePct) {
-  const opened = await hostCall("cw.browser.open", { session, url, purpose: "study" });
+  let opened = null;
+  try {
+    opened = await hostCall("cw.browser.open", { session, url, purpose: "study" });
+  } catch (error) {
+    return { status: "needs_human", reason: `\u5B98\u65B9\u6D4F\u89C8\u5668\u4E0D\u53EF\u7528\uFF1A${errorText(error)}` };
+  }
   const page = opened?.page;
   if (!page) return { status: "needs_human", reason: "\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4" };
   let result = null;
@@ -836,6 +847,9 @@ async function browserStudy(session, courseId, groupId, url, mode, values, auth,
     });
     log("info", `browser ${mode} ${groupId}: ${JSON.stringify(result).slice(0, 200)}`);
     await new Promise((resolve) => setTimeout(resolve, 4e3));
+  } catch (error) {
+    result = { error: errorText(error) };
+    log("warn", `browser ${mode} ${groupId} failed: ${errorText(error)}`);
   } finally {
     await hostCall("cw.browser.close", { session, page }).catch(() => {
     });
@@ -870,7 +884,7 @@ async function studyFillblankBrowser(session, courseId, groupId, decoded, questi
   if (answers.length === 0) {
     return { status: "needs_human", reason: "\u586B\u7A7A\u9898\u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
   }
-  return browserStudy(
+  const result = await browserStudy(
     session,
     courseId,
     groupId,
@@ -880,6 +894,10 @@ async function studyFillblankBrowser(session, courseId, groupId, decoded, questi
     auth,
     minScorePct
   );
+  return {
+    ...result,
+    evidence: { ...result.evidence, fill_answers: answers }
+  };
 }
 function matchChoiceCaption(options, texts) {
   const normalized = texts.map((value) => String(value).trim()).filter(Boolean);
@@ -918,7 +936,7 @@ async function studyChoiceBrowser(session, courseId, groupId, decoded, questions
   const solved = await solveChoiceQuestions(session, choice.group);
   if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
   const captions = choiceCaptions(choice.group, solved);
-  return browserStudy(
+  const result = await browserStudy(
     session,
     courseId,
     groupId,
@@ -928,23 +946,32 @@ async function studyChoiceBrowser(session, courseId, groupId, decoded, questions
     auth,
     minScorePct
   );
+  return {
+    ...result,
+    evidence: { ...result.evidence, choice_answers: captions }
+  };
 }
-async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct) {
+async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, precomputedValues) {
+  if (!isSinglePageTask(questionsList)) {
+    return { status: "needs_human", reason: "\u591A\u9875\u9898\u7EC4\u6682\u4E0D\u652F\u6301 API \u63D0\u4EA4" };
+  }
   const category = String(questionGroup.category ?? "").toLowerCase();
   const isFill = /fillblank/.test(category);
   const choice = isFill ? null : findChoiceGroup(decoded);
-  let values = [];
+  let values = precomputedValues ?? [];
   if (isFill) {
-    values = scriptAnswers(decoded);
+    if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
       const solved = await solveTextQuestions(session, questionGroup);
       if (!solved) return { status: "needs_human", reason: "fillblankScoop \u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
       values = (questionGroup.questions ?? []).map((_, index) => solved[String(index)]?.[0] ?? "");
     }
   } else if (choice) {
-    const solved = await solveChoiceQuestions(session, choice.group);
-    if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
-    values = choiceCaptions(choice.group, solved);
+    if (values.length === 0) {
+      const solved = await solveChoiceQuestions(session, choice.group);
+      if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
+      values = choiceCaptions(choice.group, solved);
+    }
   } else {
     return { status: "needs_human", reason: `\u672A\u652F\u6301\u7684\u5BA2\u89C2\u9898\u7C7B\u578B ${category || "unknown"}` };
   }
@@ -1124,7 +1151,39 @@ async function studyTask(session, courseId, unit, auth) {
   const isChoice = category === "singlechoice" || category === "truefalse" || category === "true_false" || category === "choice";
   if (isFill) {
     if (BROWSER_STUDY) {
-      return studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct);
+      const browserResult = await studyFillblankBrowser(
+        session,
+        courseId,
+        groupId,
+        decoded,
+        questionGroup,
+        questionsList,
+        auth,
+        minScorePct
+      );
+      if (browserResult.status === "completed") return browserResult;
+      const rawState = browserResult?.evidence?.state;
+      if (!(rawState === void 0 || rawState === null || Number(rawState) === 0)) return browserResult;
+      if (!isSinglePageTask(questionsList)) {
+        return { ...browserResult, reason: `${browserResult.reason}\uFF1B\u591A\u9875\u9898\u7EC4\u6682\u4E0D\u652F\u6301 API \u515C\u5E95` };
+      }
+      log("warn", `browser did not submit ${groupId}, falling back to API`);
+      const apiResult = await studyObjectiveApi(
+        session,
+        courseId,
+        groupId,
+        decoded,
+        questionGroup,
+        questionsList,
+        indexMap,
+        auth,
+        minScorePct,
+        browserResult?.evidence?.fill_answers
+      );
+      if (apiResult.status === "completed") {
+        return { ...apiResult, evidence: { ...apiResult.evidence, fallback: "browser_to_api" } };
+      }
+      return apiResult;
     }
     if (SETTINGS.enable_task_submit !== true) {
       return { status: "needs_human", reason: "\u586B\u7A7A\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
@@ -1133,7 +1192,38 @@ async function studyTask(session, courseId, unit, auth) {
   }
   if (isChoice) {
     if (BROWSER_STUDY) {
-      return studyChoiceBrowser(session, courseId, groupId, decoded, questionsList, auth, minScorePct);
+      const browserResult = await studyChoiceBrowser(
+        session,
+        courseId,
+        groupId,
+        decoded,
+        questionsList,
+        auth,
+        minScorePct
+      );
+      if (browserResult.status === "completed") return browserResult;
+      const rawState = browserResult?.evidence?.state;
+      if (!(rawState === void 0 || rawState === null || Number(rawState) === 0)) return browserResult;
+      if (!isSinglePageTask(questionsList)) {
+        return { ...browserResult, reason: `${browserResult.reason}\uFF1B\u591A\u9875\u9898\u7EC4\u6682\u4E0D\u652F\u6301 API \u515C\u5E95` };
+      }
+      log("warn", `browser did not submit ${groupId}, falling back to API`);
+      const apiResult = await studyObjectiveApi(
+        session,
+        courseId,
+        groupId,
+        decoded,
+        questionGroup,
+        questionsList,
+        indexMap,
+        auth,
+        minScorePct,
+        browserResult?.evidence?.choice_answers
+      );
+      if (apiResult.status === "completed") {
+        return { ...apiResult, evidence: { ...apiResult.evidence, fallback: "browser_to_api" } };
+      }
+      return apiResult;
     }
     if (SETTINGS.enable_task_submit !== true) {
       return { status: "needs_human", reason: "\u9009\u62E9\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };

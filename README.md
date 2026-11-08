@@ -11,7 +11,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 课程目录页解析 `course_v1` 课程 ID
 - 课程树 + 每个 Unit 的 `course_progress`，映射成阅读/视频/题组单元
 
-现在已跑通客观题的完整链路：
+现在已跑通单页客观题的完整链路（多页题组见“已知限制”）：
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
 - 题组提交：`POST /course/api/v3/submit/<course>/<group>/`，真实 envelope 已对齐
@@ -118,6 +118,8 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 6. 在“小U只记录你第一次答题的得分”弹窗里点 **确认**（不是“确定”）；
 7. 平台返回 `code 0`，回读 `score_avg=100`、`state=1`。
 
+浏览器路径失败时，如果平台状态仍是 `state=0`（没有提交成功），且是单页题组，模块会自动用同一组答案走 API 兜底，避免分页/无头布局导致白跑。框架没有配置 `CF_CHROMIUM` 时也会走这条兜底。
+
 已确认可用：
 
 - 阅读/视频：`POST /api/mobile/user_group/<course>/<group>/progress/`，body
@@ -129,6 +131,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 写入有频率限制（`600001/600002 操作过于频繁`），模块返回 `in_progress`，需要等几分钟再继续。
 - 题组有开放时间：`flowStrategy.startTime` 未到时平台会提示“学习开始时间未到，不能提交”；模块在打开浏览器前直接返回 `blocked`，不会白白消耗首次得分。
 - 首次得分锁定：`record_every_submit=false`、`record_max_submit=false`，第一次提交必须用正确答案。
+- 多页题组（`summary.questionsList` 使用 `p_1..p_N`、每页单独 qid，例如 Short conversations）暂不走 API 提交；浏览器路径也只处理单页可见题组，遇到多页会返回 `needs_human`，不会写入错误答案。
 
 ## 安装
 
