@@ -51,6 +51,16 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 实测：u2g72（简答）提交后 `pass=1`；u2g76、u2g567 属于客观题，即使 `pass=1` 也会记录 0 分。
 
+## 已知硬限制：Flash 录音器遮罩
+
+这套视听说课件在题目页会加载 Flash 录音器组件，并弹出 `bfg-mask` 遮罩（提示“Flash 版本过低/正在下载 Flash 录音器”）。在无头 Chromium 里：
+
+- 遮罩会拦截选项和提交按钮的点击；
+- 即使绕过遮罩、把输入框填好，点“提交”也只会弹 Flash 提示，不会发出 `/course/api/v3/submit` 请求；
+- 因此音频类客观题目前无法在纯 HTTP 或无头浏览器里完成自动交卷。
+
+阅读和视频节点不依赖该录音器，仍可正常自动完成。
+
 已确认可用：
 
 - 阅读/视频：`POST /api/mobile/user_group/<course>/<group>/progress/`，body
