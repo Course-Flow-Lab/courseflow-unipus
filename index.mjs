@@ -25,6 +25,14 @@ var SCHOOL_ID = (() => {
   const match = CLASS_URL.match(/[?&]school_id=(\d+)/);
   return match ? match[1] : "";
 })();
+var CLASS_ID = (() => {
+  const match = CLASS_URL.match(/[?&]classId=(\d+)/);
+  return match ? match[1] : "";
+})();
+var DB_COURSE_ID = (() => {
+  const match = CLASS_URL.match(/[?&]courseId=(\d+)/);
+  return match ? match[1] : "";
+})();
 var LOGIN_AES_KEY = Buffer.from("8AD70B641C024C7ADA2ECD082EC0334F", "hex");
 var LOGIN_AES_IV = Buffer.from("0102030405060708090A0B0C0D0E0F10", "hex");
 var CONTENT_KEY_PREFIX = "1a2b3c4d";
@@ -208,6 +216,23 @@ async function liveLogin(session, username, password) {
   const token = tokenJson.token ?? tokenJson.data?.token;
   const resolvedOpenId = tokenJson.openId ?? tokenJson.data?.openId ?? openId;
   if (!token) throw new Error("getToken \u672A\u8FD4\u56DE token");
+  if (CLASS_ID && DB_COURSE_ID) {
+    try {
+      await fetcher(
+        `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
+        {
+          headers: {
+            ...BROWSER_HEADERS,
+            accept: "text/html, */*; q=0.01",
+            referer: service,
+            "x-requested-with": "XMLHttpRequest"
+          }
+        }
+      );
+    } catch (error) {
+      log("warn", `automaticJoinClass failed: ${errorText(error)}`);
+    }
+  }
   return { token: String(token), openId: String(resolvedOpenId ?? ""), displayName: username };
 }
 async function authSubmit(params) {
@@ -368,6 +393,15 @@ async function catalogUnits(params) {
     };
   }
   const tree = typeof treeJson.course === "string" ? JSON.parse(treeJson.course) : treeJson.course;
+  const version = String(treeJson.publish_version ?? treeJson.version ?? "");
+  if (version) {
+    await hostCall("cw.state", {
+      session,
+      namespace: "course",
+      key: courseId,
+      value: { version, at: Date.now() }
+    });
+  }
   const units = [];
   for (const unit of tree?.units ?? []) {
     const unitId = String(unit.url ?? "");
@@ -477,6 +511,12 @@ async function groupState(session, courseId, groupId, auth) {
 async function studyLeaf(session, courseId, unit, auth) {
   const groupId = String(unit.id ?? "").split("::")[0];
   if (!groupId) throw { code: "invalid_params", message: "\u7F3A\u5C11 group id" };
+  let version = "default";
+  try {
+    const stored = await hostCall("cw.state", { session, namespace: "course", key: courseId });
+    if (stored?.value?.version) version = String(stored.value.version);
+  } catch {
+  }
   const response = await hostFetchFor(session, "save_study")(
     `${UCONTENT_BASE}/api/mobile/user_group/${courseId}/${groupId}/progress/v2/`,
     {
@@ -484,12 +524,34 @@ async function studyLeaf(session, courseId, unit, auth) {
       headers: {
         ...BROWSER_HEADERS,
         ...annotatorHeaders(auth),
-        "content-type": "application/json"
+        "content-type": "application/json",
+        origin: UCONTENT_BASE,
+        referer: `${UCONTENT_BASE}/_pc_default/pc.html`
       },
-      body: JSON.stringify({ score: {}, version: "default" })
+      body: JSON.stringify({ score: {}, version })
     }
   );
-  log("info", `finish group ${groupId} HTTP ${response.status} ${response.body.slice(0, 120)}`);
+  let payload = null;
+  try {
+    payload = JSON.parse(response.body);
+  } catch {
+  }
+  log("info", `finish group ${groupId} v=${version} HTTP ${response.status} ${response.body.slice(0, 120)}`);
+  const code = Number(payload?.code ?? 0);
+  if (code === 600001 || code === 600002) {
+    return {
+      status: "in_progress",
+      wait_ms: 6e4,
+      checkpoint: { phase: "rate_limited" },
+      evidence: { rate_limited: true, message: payload?.msg ?? "" }
+    };
+  }
+  if (code !== 0) {
+    return {
+      status: "needs_human",
+      reason: `\u8FDB\u5EA6\u5199\u5165\u5931\u8D25\uFF1Acode ${code} ${payload?.msg ?? response.body.slice(0, 120)}`
+    };
+  }
   await new Promise((resolve) => setTimeout(resolve, 1200));
   const state = await groupState(session, courseId, groupId, auth);
   const pass = Number(state?.data?.state?.state ?? 0);
