@@ -770,10 +770,15 @@ async function solveChoiceQuestions(session: string, group: any): Promise<Record
 
 function findQuestionGroup(decoded: any): any | null {
   if (!decoded || typeof decoded !== 'object') return null;
-  for (const value of Object.values(decoded) as any[]) {
-    if (value && Array.isArray(value.questions)) return value;
-  }
-  return null;
+  const groups = (Object.values(decoded) as any[]).filter(
+    (value) => value && Array.isArray(value.questions),
+  );
+  if (groups.length === 0) return null;
+  if (groups.length === 1) return groups[0];
+  return {
+    ...groups[0],
+    questions: groups.flatMap((group) => group.questions ?? []),
+  };
 }
 
 function pageMeta(indexMap: any, pageId: string): { qid?: string; rules: any } {
@@ -1133,12 +1138,9 @@ async function studyObjectiveApi(
   minScorePct: number,
   precomputedValues?: string[],
 ) {
-  if (!isSinglePageTask(questionsList)) {
-    return { status: 'needs_human', reason: '多页题组暂不支持 API 提交' };
-  }
   const category = String(questionGroup.category ?? '').toLowerCase();
   const isFill = /fillblank/.test(category);
-  const choice = isFill ? null : findChoiceGroup(decoded);
+  const choice = isFill ? null : { group: questionGroup, category };
   let values: string[] = precomputedValues ?? [];
   if (isFill) {
     if (values.length === 0) values = scriptAnswers(decoded);
@@ -1166,6 +1168,7 @@ async function studyObjectiveApi(
   const firstQid = collectQids(indexMap)[0];
   if (!firstQid) return { status: 'needs_human', reason: '题组没有返回 qid' };
 
+  const multiPage = !isSinglePageTask(questionsList);
   const pages: Record<string, any> = {};
   const answerList: Record<string, any> = {};
   const answers: Record<string, any> = {};
@@ -1179,6 +1182,8 @@ async function studyObjectiveApi(
         (isFill ? 'in' : 'eq'),
     );
     const value = values[index] ?? '';
+    const answerIndex = multiPage ? 0 : index;
+    const offset = multiPage ? index : 0;
     answerList[String(index)] = {
       student_answer: value,
       isDone: true,
@@ -1193,18 +1198,19 @@ async function studyObjectiveApi(
       user_answer: {
         qid,
         rule,
-        answer: { index, answer: value, version: 'v2' },
+        answer: { index: answerIndex, answer: value, version: 'v2' },
         content: '',
-        id: `${qid}-${index}`,
-        offset: 0,
+        id: `${qid}-${answerIndex}`,
+        offset,
       },
     };
     const existingComponent = userState?.state?.[pageId]
       ? Object.keys(userState.state[pageId])[0]
       : '';
     const component = existingComponent || 'c_1_1';
-    pages[pageId] ??= { [component]: { student_answers: {} } };
-    pages[pageId][component].student_answers[String(index)] = value;
+    pages[pageId] ??= { [component]: { student_answers: multiPage ? [] : {} } };
+    if (multiPage) pages[pageId][component].student_answers[0] = value;
+    else pages[pageId][component].student_answers[String(index)] = value;
   }
 
   const stateObj = {
@@ -1336,6 +1342,12 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
   const isFill = /fillblank/.test(category);
   const isChoice = category === 'singlechoice' || category === 'truefalse' || category === 'true_false' || category === 'choice';
   if (isFill) {
+    if (!isSinglePageTask(questionsList)) {
+      if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
+        return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+      }
+      return { status: 'needs_human', reason: '多页填空题会计分，自动提交默认关闭' };
+    }
     if (BROWSER_STUDY) {
       const browserResult: any = await studyFillblankBrowser(
         session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
@@ -1362,6 +1374,12 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
   }
   if (isChoice) {
+    if (!isSinglePageTask(questionsList)) {
+      if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
+        return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+      }
+      return { status: 'needs_human', reason: '多页选择题会计分，自动提交默认关闭' };
+    }
     if (BROWSER_STUDY) {
       const browserResult: any = await studyChoiceBrowser(
         session, courseId, groupId, decoded, questionsList, auth, minScorePct,

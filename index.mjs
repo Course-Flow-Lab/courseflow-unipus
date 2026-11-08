@@ -648,10 +648,15 @@ async function solveChoiceQuestions(session, group) {
 }
 function findQuestionGroup(decoded) {
   if (!decoded || typeof decoded !== "object") return null;
-  for (const value of Object.values(decoded)) {
-    if (value && Array.isArray(value.questions)) return value;
-  }
-  return null;
+  const groups = Object.values(decoded).filter(
+    (value) => value && Array.isArray(value.questions)
+  );
+  if (groups.length === 0) return null;
+  if (groups.length === 1) return groups[0];
+  return {
+    ...groups[0],
+    questions: groups.flatMap((group) => group.questions ?? [])
+  };
 }
 function pageMeta(indexMap, pageId) {
   let found = null;
@@ -952,12 +957,9 @@ async function studyChoiceBrowser(session, courseId, groupId, decoded, questions
   };
 }
 async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, precomputedValues) {
-  if (!isSinglePageTask(questionsList)) {
-    return { status: "needs_human", reason: "\u591A\u9875\u9898\u7EC4\u6682\u4E0D\u652F\u6301 API \u63D0\u4EA4" };
-  }
   const category = String(questionGroup.category ?? "").toLowerCase();
   const isFill = /fillblank/.test(category);
-  const choice = isFill ? null : findChoiceGroup(decoded);
+  const choice = isFill ? null : { group: questionGroup, category };
   let values = precomputedValues ?? [];
   if (isFill) {
     if (values.length === 0) values = scriptAnswers(decoded);
@@ -983,6 +985,7 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
   );
   const firstQid = collectQids(indexMap)[0];
   if (!firstQid) return { status: "needs_human", reason: "\u9898\u7EC4\u6CA1\u6709\u8FD4\u56DE qid" };
+  const multiPage = !isSinglePageTask(questionsList);
   const pages = {};
   const answerList = {};
   const answers = {};
@@ -995,6 +998,8 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
       (Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules) ?? (isFill ? "in" : "eq")
     );
     const value = values[index] ?? "";
+    const answerIndex = multiPage ? 0 : index;
+    const offset = multiPage ? index : 0;
     answerList[String(index)] = {
       student_answer: value,
       isDone: true,
@@ -1009,16 +1014,17 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
       user_answer: {
         qid,
         rule,
-        answer: { index, answer: value, version: "v2" },
+        answer: { index: answerIndex, answer: value, version: "v2" },
         content: "",
-        id: `${qid}-${index}`,
-        offset: 0
+        id: `${qid}-${answerIndex}`,
+        offset
       }
     };
     const existingComponent = userState?.state?.[pageId] ? Object.keys(userState.state[pageId])[0] : "";
     const component = existingComponent || "c_1_1";
-    pages[pageId] ??= { [component]: { student_answers: {} } };
-    pages[pageId][component].student_answers[String(index)] = value;
+    pages[pageId] ??= { [component]: { student_answers: multiPage ? [] : {} } };
+    if (multiPage) pages[pageId][component].student_answers[0] = value;
+    else pages[pageId][component].student_answers[String(index)] = value;
   }
   const stateObj = {
     version,
@@ -1150,6 +1156,12 @@ async function studyTask(session, courseId, unit, auth) {
   const isFill = /fillblank/.test(category);
   const isChoice = category === "singlechoice" || category === "truefalse" || category === "true_false" || category === "choice";
   if (isFill) {
+    if (!isSinglePageTask(questionsList)) {
+      if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
+        return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+      }
+      return { status: "needs_human", reason: "\u591A\u9875\u586B\u7A7A\u9898\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
+    }
     if (BROWSER_STUDY) {
       const browserResult = await studyFillblankBrowser(
         session,
@@ -1191,6 +1203,12 @@ async function studyTask(session, courseId, unit, auth) {
     return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
   }
   if (isChoice) {
+    if (!isSinglePageTask(questionsList)) {
+      if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
+        return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+      }
+      return { status: "needs_human", reason: "\u591A\u9875\u9009\u62E9\u9898\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
+    }
     if (BROWSER_STUDY) {
       const browserResult = await studyChoiceBrowser(
         session,

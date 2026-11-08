@@ -11,7 +11,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 课程目录页解析 `course_v1` 课程 ID
 - 课程树 + 每个 Unit 的 `course_progress`，映射成阅读/视频/题组单元
 
-现在已跑通单页客观题的完整链路（多页题组见“已知限制”）：
+现在已跑通单页和多页客观题的完整链路：
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
 - 题组提交：`POST /course/api/v3/submit/<course>/<group>/`，真实 envelope 已对齐
@@ -96,6 +96,25 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 注意：AI 返回 `"B"` 这类单字母时，只能按 `caption` 精确匹配。不能对选项原文做 `includes("B")`，否则 `"Because ..."` 会被误判成 B 选项。
 
+### 多页题组（Short conversations）
+
+多页题组和单页结构不同：
+
+- `summary.questionsList` 使用 `p_1..p_N`，每页单独 qid
+- `content` 也被拆成 `content_1..content_N`，每个 group 只有一个 question
+- 模块会按顺序合并所有 `content_*.questions`，再统一作答
+- `state` 里每页写数组：
+  ```json
+  "p_1": { "c_1_1": { "student_answers": ["B"] } },
+  "p_2": { "c_1_1": { "student_answers": ["A"] } }
+  ```
+- `__SUMMARY__.answerList` 仍用全局 `0..N`
+- `answers[i].user_answer.answer.index` 是页内索引 `0`
+- `answers[i].user_answer.id` 是 `<qid>-0`
+- `answers[i].user_answer.offset` 是页序号 `0..N`
+
+实测 `u8g514`（Short conversations，5 页）：**100 分**。
+
 ## Playwright 浏览器提交（已验证）
 
 用 Edge 远程调试（`--remote-debugging-port=9222`）+ Playwright `connectOverCDP`，通过模块的 `cw.browser` 已完成：
@@ -107,6 +126,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 - u4g254（fillblankScoop，10 空，required）：100 分
 - u3g192（singlechoice，2 题）：100 分
+- u8g514（Short conversations，多页 5 题）：100 分
 
 流程：
 
@@ -118,7 +138,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 6. 在“小U只记录你第一次答题的得分”弹窗里点 **确认**（不是“确定”）；
 7. 平台返回 `code 0`，回读 `score_avg=100`、`state=1`。
 
-浏览器路径失败时，如果平台状态仍是 `state=0`（没有提交成功），且是单页题组，模块会自动用同一组答案走 API 兜底，避免分页/无头布局导致白跑。框架没有配置 `CF_CHROMIUM` 时也会走这条兜底。
+单页题组的浏览器路径失败时，如果平台状态仍是 `state=0`（没有提交成功），模块会自动用同一组答案走 API 兜底，避免无头布局导致白跑。多页题组直接走 API，不依赖浏览器。框架没有配置 `CF_CHROMIUM` 时也会走 API 兜底。
 
 已确认可用：
 
@@ -131,7 +151,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 写入有频率限制（`600001/600002 操作过于频繁`），模块返回 `in_progress`，需要等几分钟再继续。
 - 题组有开放时间：`flowStrategy.startTime` 未到时平台会提示“学习开始时间未到，不能提交”；模块在打开浏览器前直接返回 `blocked`，不会白白消耗首次得分。
 - 首次得分锁定：`record_every_submit=false`、`record_max_submit=false`，第一次提交必须用正确答案。
-- 多页题组（`summary.questionsList` 使用 `p_1..p_N`、每页单独 qid，例如 Short conversations）暂不走 API 提交；浏览器路径也只处理单页可见题组，遇到多页会返回 `needs_human`，不会写入错误答案。
+- 多页题组已支持 API 自动提交；浏览器路径仍只用于单页题组。
 
 ## 安装
 
