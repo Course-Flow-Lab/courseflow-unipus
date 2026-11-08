@@ -248,6 +248,12 @@ async function liveLogin(session: string, username: string, password: string) {
   const tokenResponse = await fetcher(`${UNIPUS_BASE}/user/data/getToken`, {
     headers: { ...BROWSER_HEADERS, accept: 'application/json, text/plain, */*', referer: service },
   });
+  if (tokenResponse.status === 302 || !tokenResponse.ok) {
+    throw {
+      code: 'platform_session_conflict',
+      message: '账号已在其他设备/浏览器登录，请先在官方页面退出后重试',
+    };
+  }
   let tokenJson: any;
   try {
     tokenJson = JSON.parse(tokenResponse.body);

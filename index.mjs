@@ -207,6 +207,12 @@ async function liveLogin(session, username, password) {
   const tokenResponse = await fetcher(`${UNIPUS_BASE}/user/data/getToken`, {
     headers: { ...BROWSER_HEADERS, accept: "application/json, text/plain, */*", referer: service }
   });
+  if (tokenResponse.status === 302 || !tokenResponse.ok) {
+    throw {
+      code: "platform_session_conflict",
+      message: "\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u8BBE\u5907/\u6D4F\u89C8\u5668\u767B\u5F55\uFF0C\u8BF7\u5148\u5728\u5B98\u65B9\u9875\u9762\u9000\u51FA\u540E\u91CD\u8BD5"
+    };
+  }
   let tokenJson;
   try {
     tokenJson = JSON.parse(tokenResponse.body);

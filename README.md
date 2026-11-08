@@ -15,7 +15,12 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
 - 题组提交：`/course/api/v3/submit` 的题型 payload 还未逐类验证
-- 阅读/视频完成：`/api/mobile/user_group/.../progress/v2` 的字段还需按课件实际请求补齐
+- 阅读/视频完成：`/api/mobile/user_group/.../progress/v2` 需要带课程发布版本（课程树的 `publish_version`），字段已接上，等待风控冷却后验证
+
+## 已知限制
+
+- 平台强制单会话：账号在手机/其他浏览器登录时，`getToken` 会 302 到 `repeatLogin`，模块返回 `platform_session_conflict`。需要先在官方页面退出，或让模块自动把其他会话踢下线。
+- 写入有频率限制（`600001/600002 操作过于频繁`），模块返回 `in_progress`，需要等几分钟再继续。
 
 ## 安装
 
