@@ -242,6 +242,79 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 阅读/视频：`POST /api/mobile/user_group/<course>/<group>/progress/`，body
   `{"status":1,"rid":"flowengine:studyStatus:1:<group>","groupId":"<group>","version":"default"}`
 
+## uexercise 单元测试 runner
+
+单元测试是 `uexercise.unipus.cn` 的独立试卷应用，不在普通 `study.step` 协议里。仓库提供独立 runner：
+
+```bash
+npm run uexercise -- --help
+```
+
+### 1. 导出题目
+
+```bash
+node scripts/uexercise-runner.mjs \
+  --storage-state u-storage.json \
+  --courseware-url "https://ucontent.unipus.cn/.../u3g196/p_1" \
+  --dump --out ut-questions.json
+```
+
+输出包含：
+
+- 25 道题的 `qIndex`
+- 每题的选项（注意页面选项顺序是随机的）
+- 输入框题目
+- 音频 URL 列表
+- `sppid`、`exerciseId`、表单 action
+
+### 2. 准备答案
+
+```json
+{
+  "1": "D",
+  "2": "A",
+  "3": "C",
+  "16": "word",
+  "17": "word"
+}
+```
+
+规则：
+
+- 选择题可以写显示字母 `A/B/C/D`，也可以写选项原文
+- 填空题写文本
+- 没有答案的题可以留空；runner 会报告 `missing`
+
+### 3. 演练或交卷
+
+```bash
+# 只填答案，不提交
+node scripts/uexercise-runner.mjs \
+  --storage-state u-storage.json \
+  --courseware-url "https://ucontent.unipus.cn/.../u3g196/p_1" \
+  --answers ut-answers.json
+
+# 真正交卷
+node scripts/uexercise-runner.mjs \
+  --storage-state u-storage.json \
+  --courseware-url "https://ucontent.unipus.cn/.../u3g196/p_1" \
+  --answers ut-answers.json --submit
+```
+
+当前 runner 已验证：
+
+- 能打开课件页并触发 `PCUtButton.todoSubject`
+- 能拿到 `enter_unit_test` iframe URL
+- 能解析 25 题
+- 能按 qIndex 填 5 个单选 + 10 个填空
+- 默认 dry-run，不交卷
+
+还没有在平台上真实交卷，因为 Unit 3 试卷是 required，答案未准备完整时会锁首次成绩。runner 的提交路径和表单 action 已经抓到：
+
+```text
+POST /itest/s/clsanswer/submitUT
+```
+
 ## 已知限制
 
 - 平台强制单会话：账号在手机/其他浏览器登录时，`getToken` 会 302 到 `repeatLogin`，模块返回 `platform_session_conflict`。需要先在官方页面退出，或让模块自动把其他会话踢下线。
@@ -252,7 +325,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - ASR 是本地 CPU 转写，2.5 分钟音频约 20 秒；如果框架调用预算更紧，可把 `asr_model` 改成 `tiny.en`，或提前把模型缓存好。
 - ASR 依赖 `python`、`faster-whisper`、`ffmpeg`；模块安装时会把 `scripts/transcribe_audio.py` 一起复制。
 - 口语/录音题（roleplay、presentation、sentencesforrecord）不做自动提交，统一返回 `needs_human`。
-- 单元测试 `quiz-paper-link` 已纳入目录，并带 `exercise_id`/`exam_id` 元数据；它实际是 `uexercise.unipus.cn` 的独立试卷应用（25 题，含听力/听写），当前只返回 `needs_human`，不自动交卷。
+- 单元测试 `quiz-paper-link` 已纳入目录，并带 `exercise_id`/`exam_id` 元数据；它实际是 `uexercise.unipus.cn` 的独立试卷应用（25 题，含听力/听写）。模块内仍返回 `needs_human`，自动答题/交卷请使用独立的 `scripts/uexercise-runner.mjs`。
 
 ## 安装
 

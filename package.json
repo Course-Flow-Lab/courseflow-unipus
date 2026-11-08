@@ -5,11 +5,15 @@
   "type": "module",
   "description": "Courseflow U校园普通版模块",
   "license": "MIT",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "build": "esbuild src/module.ts --bundle --platform=node --format=esm --outfile=index.mjs --external:node:*"
+    "build": "esbuild src/module.ts --bundle --platform=node --format=esm --outfile=index.mjs --external:node:*",
+    "uexercise": "node scripts/uexercise-runner.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "playwright": "^1.65.0"
   }
 }
