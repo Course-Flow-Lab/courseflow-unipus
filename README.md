@@ -61,6 +61,47 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 阅读和视频节点不依赖该录音器，仍可正常自动完成。
 
+## Playwright 真实提交（已验证）
+
+用 Edge 远程调试（`--remote-debugging-port=9222`）+ Playwright `connectOverCDP`，在真实 Edge 里完成了 u2g126：
+
+1. 打开课件页；
+2. 删除 `.bfg-mask` / tooltip 遮罩；
+3. 用原生 setter 填输入框并派发 `input`/`change`；
+4. 点最后一个 `button.submit-bar-pc--btn`（提交）；
+5. 在“小U只记录你第一次答题的得分”弹窗里点 **确认**（不是“确定”）；
+6. 平台返回 `code 0`，回读 `score_avg=100`、`state=1`，页面显示「是否计入教程学习成绩：不计入」。
+
+抓到的 fillblankScoop 提交结构：
+
+```json
+{
+  "enable_mistake": false,
+  "version": "default",
+  "record_version": "<user_module.state.version>",
+  "state": "{\"version\":\"...\",\"p_1\":{\"c_1_1\":{\"student_answers\":{\"0\":\"...\"}}},\"__EXTEND_DATA__\":{\"__SUMMARY__\":{\"answerList\":{\"0\":{\"student_answer\":\"...\",\"isDone\":true,\"version\":\"v2\",\"rule\":\"in\"}}}}}",
+  "specific_scores": [null, ...],
+  "answers": {
+    "0": {
+      "student_answer": "...",
+      "isDone": true,
+      "version": "v2",
+      "rule": "in",
+      "user_answer": {
+        "qid": "...",
+        "rule": "in",
+        "answer": { "index": 0, "answer": "...", "version": "v2" },
+        "content": "",
+        "id": "<qid>-0",
+        "offset": 0
+      }
+    }
+  }
+}
+```
+
+fillblankScoop 的答案还能直接从 `content[].audio.script` 的下划线 span 提取。
+
 已确认可用：
 
 - 阅读/视频：`POST /api/mobile/user_group/<course>/<group>/progress/`，body
