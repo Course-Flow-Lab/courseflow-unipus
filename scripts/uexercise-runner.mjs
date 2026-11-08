@@ -20,6 +20,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import https from 'node:https';
 
 function parseArgs(argv) {
   const out = { submit: false, headed: false, channel: 'msedge' };
@@ -50,12 +52,15 @@ function usage() {
   --answers <file>          答案 JSON：{ "1": "A" } 或 { "1": "选项原文" }
   --generate                下载音频、ASR、AI 生成答案
   --answers-out <file>      生成答案输出，默认 uexercise-answers.json
+  --details-out <file>      保存解析出的题目/选项/段落，便于离线评估
+  --transcripts <file>      复用已有 ASR JSON，跳过转写
   --transcripts-out <file>  保存 ASR 转写 JSON
   --asr-model <name>        faster-whisper 模型，默认 base.en
   --asr-python <path>       默认 python
-  --ai-base <url>           OpenAI 兼容地址，如 https://api.siliconflow.cn/v1
-  --ai-key <key>            AI Key；也可用 UEX_AI_KEY
-  --ai-model <name>         AI 模型名
+  --ai-base <url>           默认 http://127.0.0.1:6000/v1（magpie 网关）
+  --ai-key <key>            默认 local；也可用 UEX_AI_KEY
+  --ai-model <name>         默认 auto/deepseek-v4.1-flash
+  --ai-concurrency <n>      逐题 AI 并发数，默认 2
   --heuristic               不调用 AI，使用关键词匹配兜底
   --dump                    只解析题目，输出 JSON
   --out <file>              dump 输出文件，默认 stdout
@@ -196,6 +201,7 @@ async function readExam(page) {
         sectionId: section.getAttribute('sectionId') ?? '',
         sectionType: section.getAttribute('sectionType') ?? '',
         title: (section.querySelector('.title')?.innerText ?? '').replace(/\s+/g, ' ').trim(),
+        text: (section.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 6000),
         audio: sectionAudio,
         questions: questionSets,
       };
@@ -210,7 +216,7 @@ async function readExam(page) {
       questions,
       audio,
       sections,
-      body: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1500),
+      body: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 12000),
     };
   });
 }
@@ -301,6 +307,13 @@ async function submitExam(page) {
   };
 }
 
+function transcriptText(value, labeled = false) {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return '';
+  if (labeled) return String(value.labeled || value.text || '');
+  return String(value.text || value.labeled || '');
+}
+
 function parseAudioGroup(value) {
   try {
     const parsed = JSON.parse(String(value));
@@ -380,17 +393,17 @@ function transcriptsByUrl(details, manifest, transcripts) {
 
 function questionTranscripts(details, byUrl) {
   const map = {};
-  const all = [...byUrl.values()].filter(Boolean).join(' ');
+  const all = [...byUrl.values()].map((value) => transcriptText(value, true)).filter(Boolean).join(' ');
   for (const section of details.sections ?? []) {
     const sectionText = (section.audio ?? [])
       .flatMap(parseAudioGroup)
-      .map((url) => byUrl.get(url) ?? '')
+      .map((url) => transcriptText(byUrl.get(url), true))
       .filter(Boolean)
       .join(' ');
     for (const question of section.questions ?? []) {
       const questionText = (question.audio ?? [])
         .flatMap(parseAudioGroup)
-        .map((url) => byUrl.get(url) ?? '')
+        .map((url) => transcriptText(byUrl.get(url), true))
         .filter(Boolean)
         .join(' ');
       const text = questionText || sectionText || all;
@@ -400,50 +413,57 @@ function questionTranscripts(details, byUrl) {
   return map;
 }
 
-function buildAiPrompt(details, byUrl) {
-  const transcripts = [...byUrl.entries()]
-    .filter(([, text]) => text)
-    .map(([url, text], index) => `[T${index + 1}] ${text}`)
-    .join('\n');
-  const questions = details.questions.map((question) => ({
-    index: question.index,
-    type: question.type,
-    options: question.options?.map((option) => option.text) ?? [],
-  }));
-  return [
-    '你是 U校园单元测试答题助手。',
-    '根据听力转写和题目，给出每道题的答案。',
-    '选择题返回页面显示的选项字母（A/B/C/D）；填空题返回要填入的文本。',
-    '只输出一个 JSON 对象，key 是题号，value 是答案字符串，例如 {"1":"D","16":"word"}。',
-    '题目：',
-    JSON.stringify(questions),
-    '听力转写：',
-    transcripts,
-  ].join('\n');
+function postJson(urlString, body, headers = {}, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString);
+    const transport = url.protocol === 'https:' ? https : http;
+    const payload = JSON.stringify(body);
+    const request = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+          ...headers,
+        },
+      },
+      (response) => {
+        let data = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { data += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, text: data }));
+      },
+    );
+    const timer = setTimeout(() => {
+      request.destroy();
+      reject(new Error('AI request timeout'));
+    }, timeoutMs);
+    request.on('error', (error) => { clearTimeout(timer); reject(error); });
+    request.on('close', () => clearTimeout(timer));
+    request.write(payload);
+    request.end();
+  });
 }
 
 async function callAi(args, prompt) {
-  const base = args['ai-base'] ?? process.env.UEX_AI_BASE;
-  const key = args['ai-key'] ?? process.env.UEX_AI_KEY;
-  const model = args['ai-model'] ?? process.env.UEX_AI_MODEL;
-  if (!base || !key || !model) return null;
+  const base = args['ai-base'] ?? process.env.UEX_AI_BASE ?? 'http://127.0.0.1:6000/v1';
+  const key = args['ai-key'] ?? process.env.UEX_AI_KEY ?? 'local';
+  const model = args['ai-model'] ?? process.env.UEX_AI_MODEL ?? 'auto/deepseek-v4.1-flash';
   const endpoint = base.endsWith('/chat/completions') ? base : `${base.replace(/\/$/, '')}/chat/completions`;
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: '你是课程答题助手，只输出合法 JSON。' },
-        { role: 'user', content: prompt },
-      ],
-      stream: false,
-    }),
-    signal: AbortSignal.timeout(120000),
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI HTTP ${response.status}: ${text.slice(0, 200)}`);
-  const data = JSON.parse(text);
+  const response = await postJson(endpoint, {
+    model,
+    messages: [
+      { role: 'system', content: '你是课程答题助手，只输出合法 JSON。' },
+      { role: 'user', content: prompt },
+    ],
+    stream: false,
+  }, { authorization: `Bearer ${key}` });
+  if (response.status !== 200) throw new Error(`AI HTTP ${response.status}: ${response.text.slice(0, 200)}`);
+  const data = JSON.parse(response.text);
   const content = String(data.choices?.[0]?.message?.content ?? '').trim();
   const start = content.indexOf('{');
   const end = content.lastIndexOf('}');
@@ -454,6 +474,203 @@ async function callAi(args, prompt) {
     if (typeof value === 'string' || Array.isArray(value)) out[String(keyName)] = value;
   }
   return Object.keys(out).length ? out : null;
+}
+
+function stripOptionPrefix(text) {
+  return String(text ?? '').replace(/^[A-Da-d][.、)]\s*/, '').trim();
+}
+
+function matchOptionByText(raw, options) {
+  const wanted = normalizeText(String(raw ?? ''));
+  if (!wanted) return null;
+  const letter = wanted.match(/^\(?([a-d])\)?(?:[.\s]|$)/);
+  if (letter) {
+    const position = letter[1].charCodeAt(0) - 97;
+    if (options[position]) return options[position];
+  }
+  for (const option of options) {
+    const text = normalizeText(stripOptionPrefix(option.text));
+    if (!text) continue;
+    if (text === wanted || wanted.includes(text) || text.includes(wanted)) return option;
+  }
+  let best = null;
+  let bestScore = 0;
+  for (const option of options) {
+    const text = normalizeText(stripOptionPrefix(option.text));
+    const tokens = text.split(/[^a-z0-9']+/).filter((token) => token.length > 2);
+    const score = tokens.filter((token) => wanted.includes(token)).length / Math.max(1, tokens.length);
+    if (score > bestScore) { bestScore = score; best = option; }
+  }
+  return bestScore >= 0.5 ? best : null;
+}
+
+function tokenizeSpoken(text) {
+  return String(text ?? '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map((raw) => ({ raw, norm: raw.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '') }));
+}
+
+// Align the paper passage (which keeps "16)" placeholders) against the ASR
+// transcript, then read each blank straight out of the transcript. Dictation
+// answers are by definition words that were spoken, so this beats paraphrasing.
+function alignBlanks(sectionText, transcript, indexes) {
+  const wanted = new Set(indexes.map(String));
+  const template = tokenizeSpoken(sectionText).map((token) => {
+    const marker = token.raw.match(/^(\d{1,2})\)/);
+    return {
+      ...token,
+      blank: marker && wanted.has(marker[1]) ? marker[1] : null,
+    };
+  });
+  const spoken = tokenizeSpoken(transcript);
+  const n = template.length;
+  const m = spoken.length;
+  if (!n || !m) return {};
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      dp[i][j] = template[i - 1].norm && template[i - 1].norm === spoken[j - 1].norm
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  const aligned = new Array(n).fill(-1);
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (template[i - 1].norm && template[i - 1].norm === spoken[j - 1].norm && dp[i][j] === dp[i - 1][j - 1] + 1) {
+      aligned[i - 1] = j - 1;
+      i -= 1;
+      j -= 1;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  const answers = {};
+  for (let k = 0; k < n; k += 1) {
+    const marker = template[k].blank;
+    if (!marker) continue;
+    let before = -1;
+    let after = -1;
+    for (let x = k - 1; x >= 0; x -= 1) {
+      if (aligned[x] >= 0) { before = aligned[x]; break; }
+    }
+    for (let x = k + 1; x < n; x += 1) {
+      if (aligned[x] >= 0) { after = aligned[x]; break; }
+    }
+    if (before < 0 || after <= before + 1) continue;
+    const words = spoken.slice(before + 1, after)
+      .map((token) => token.raw)
+      .filter((word) => /[a-z0-9]/i.test(word));
+    if (!words.length || words.length > 8) continue;
+    answers[marker] = words.join(' ').replace(/^[,;:.\-]+|[,;:.\-]+$/g, '');
+  }
+  return answers;
+}
+
+function deterministicBlanks(details, byUrl) {
+  const byQuestion = questionTranscripts(details, byUrl);
+  const textIndexes = new Set(
+    (details.questions ?? []).filter((question) => question.type !== 'radio').map((question) => String(question.index)),
+  );
+  const answers = {};
+  for (const section of details.sections ?? []) {
+    const indexes = (section.questions ?? [])
+      .flatMap((set) => set.indexes ?? [])
+      .map(String)
+      .filter((index) => textIndexes.has(index));
+    if (!indexes.length) continue;
+    const transcript = (section.audio ?? [])
+      .flatMap(parseAudioGroup)
+      .map((url) => transcriptText(byUrl.get(url), true))
+      .filter(Boolean)
+      .join(' ') || transcriptText(byQuestion[indexes[0]], true);
+    if (!transcript) continue;
+    const blanks = alignBlanks(section.text ?? '', transcript, indexes);
+    for (const [index, value] of Object.entries(blanks)) answers[index] = value;
+  }
+  return answers;
+}
+
+async function generateAnswersPerQuestion(details, byUrl, args) {
+  const byQuestion = questionTranscripts(details, byUrl);
+  const answers = deterministicBlanks(details, byUrl);
+  const questions = (details.questions ?? []).filter((question) => question.type === 'radio');
+  const blankQuestions = (details.questions ?? []).filter((question) => question.type !== 'radio');
+  let next = 0;
+  const concurrency = Math.max(1, Math.min(4, Number(args['ai-concurrency'] ?? 2)));
+  async function worker() {
+    for (;;) {
+      const position = next++;
+      if (position >= questions.length) return;
+      const question = questions[position];
+      const transcript = String(byQuestion[question.index] ?? '');
+      const options = question.options ?? [];
+      const prompt = [
+        '你是 U校园听力测试答题助手。下面是一道听力选择题。',
+        '听力原文（M=男，W=女；末尾 Q: 是题目）：',
+        transcript,
+        '选项：',
+        ...options.map((option) => `- ${stripOptionPrefix(option.text)}`),
+        '先定位原文依据，再选最符合的一项。',
+        '只输出 JSON：{"answer":"所选选项的完整原文"}',
+      ].join('\n');
+      try {
+        const result = await callAi(args, prompt);
+        const raw = result?.answer ?? result?.[question.index] ?? Object.values(result ?? {})[0];
+        const matched = matchOptionByText(raw, options);
+        if (matched) {
+          answers[question.index] = stripOptionPrefix(matched.text);
+        } else if (raw !== undefined && raw !== null && String(raw).trim()) {
+          answers[question.index] = String(Array.isArray(raw) ? raw[0] : raw).trim();
+        } else {
+          console.error(`question ${question.index}: empty AI answer`);
+        }
+      } catch (error) {
+        console.error(`question ${question.index}: ${error.message}`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  // Dictation blanks that alignment could not resolve: ask the model, but keep
+  // the passage context so it must fill the exact gap instead of rewriting.
+  const missing = blankQuestions.filter((question) => !answers[question.index]);
+  for (const question of missing) {
+    const section = (details.sections ?? []).find((item) =>
+      (item.questions ?? []).some((set) => (set.indexes ?? []).includes(question.index)),
+    );
+    try {
+      const result = await callAi(args, [
+        '你是 U校园复合式听写答题助手。',
+        `空号：${question.index}`,
+        '试卷段落（数字是空号）：',
+        String(section?.text ?? '').slice(0, 6000),
+        '听力原文：',
+        String(byQuestion[question.index] ?? '').slice(0, 6000),
+        '只填该空对应的原词，必须与听力原文用词一致，不要改写。',
+        '只输出 JSON：{"answer":"word"}',
+      ].join('\n'));
+      const value = result?.answer ?? result?.[question.index] ?? Object.values(result ?? {})[0];
+      if (value !== undefined && value !== null && String(value).trim()) {
+        answers[question.index] = String(value).trim();
+      }
+    } catch (error) {
+      console.error(`blank ${question.index}: ${error.message}`);
+    }
+  }
+  const fallback = heuristicAnswers(details, byUrl);
+  for (const question of details.questions ?? []) {
+    if (!answers[question.index]) answers[question.index] = fallback[question.index] ?? '';
+  }
+  return answers;
 }
 
 function heuristicAnswers(details, byUrl) {
@@ -485,13 +702,15 @@ async function generateAnswers(details, args) {
   try {
     const { manifest, byUrl } = await downloadAudios(urls, directory);
     console.error(`audio: ${manifest.length} file(s)`);
-    const transcripts = await transcribeAudios(manifest, args);
+    const transcripts = args.transcripts
+      ? JSON.parse(readFileSync(args.transcripts, 'utf8'))
+      : await transcribeAudios(manifest, args);
     if (args['transcripts-out']) writeFileSync(args['transcripts-out'], JSON.stringify(transcripts, null, 2));
     const transcriptMap = transcriptsByUrl(details, manifest, transcripts);
     let answers = null;
     if (!args.heuristic) {
       try {
-        answers = await callAi(args, buildAiPrompt(details, transcriptMap));
+        answers = await generateAnswersPerQuestion(details, transcriptMap, args);
       } catch (error) {
         console.error(`AI failed: ${error.message}`);
       }
@@ -499,6 +718,9 @@ async function generateAnswers(details, args) {
     if (!answers) {
       console.error('using heuristic answer fallback');
       answers = heuristicAnswers(details, transcriptMap);
+      for (const [index, value] of Object.entries(deterministicBlanks(details, transcriptMap))) {
+        if (value) answers[index] = value;
+      }
     }
     const output = args['answers-out'] ?? 'uexercise-answers.json';
     writeFileSync(output, JSON.stringify(answers, null, 2));
@@ -543,6 +765,7 @@ async function main() {
   await dismissOverlays(exam);
   await exam.waitForTimeout(800);
   const details = await readExam(exam);
+  if (args['details-out']) writeFileSync(args['details-out'], JSON.stringify(details, null, 2));
   let answers = null;
   if (args.generate) {
     answers = await generateAnswers(details, args);

@@ -276,17 +276,19 @@ node scripts/uexercise-runner.mjs \
   --generate \
   --answers-out ut-answers.json \
   --transcripts-out ut-transcripts.json \
-  --ai-base https://api.siliconflow.cn/v1 \
-  --ai-key "$env:UEX_AI_KEY" \
-  --ai-model deepseek-ai/DeepSeek-V3.2
+  --ai-base http://127.0.0.1:6000/v1 \
+  --ai-model auto/deepseek-v4.1-flash
 ```
 
 流程：
 
 - 下载试卷里的 19 个音频
-- 调 `faster-whisper` 批量转写
-- 把题目、选项、转写一起发给 OpenAI 兼容模型
+- 调 `faster-whisper` 批量转写（默认 `base.en`，可按需换 `small.en`）
+- 复合式听写：把试卷段落（带 `16)` 空位）和 ASR 原文做词级对齐，直接抠出空位原词，不让模型改写
+- 选择题：逐题带上对应音频的转写，要求模型返回“选项原文”而不是字母（页面选项每次刷新都会重排）
 - 生成 `answers.json`
+
+`--transcripts` 可以复用已有的 ASR 结果，`--details-out` 会保存当次解析出的题目/选项/段落，便于和 review 页答案键做离线评估。
 
 没有 AI Key 时可以加 `--heuristic` 用关键词匹配兜底，但准确率有限。
 
@@ -294,17 +296,16 @@ node scripts/uexercise-runner.mjs \
 
 ```json
 {
-  "1": "D",
-  "2": "A",
-  "3": "C",
-  "16": "word",
-  "17": "word"
+  "1": "The woman wants to play golf while the man wants to play tennis.",
+  "2": "No one will pay attention to how the man dances.",
+  "16": "audience",
+  "17": "teenage"
 }
 ```
 
 规则：
 
-- 选择题可以写显示字母 `A/B/C/D`，也可以写选项原文
+- 选择题推荐写选项原文，runner 按文本匹配；写显示字母 `A/B/C/D` 也可以，但字母只对当次页面顺序有效
 - 填空题写文本
 - 没有答案的题可以留空；runner 会报告 `missing`
 
@@ -337,13 +338,14 @@ node scripts/uexercise-runner.mjs \
 实测 Unit 3：
 
 ```text
-填题：radio=15 text=10 missing=[]
-提交：HTTP 200
-结果：25 题，答对 15 题，60%
-是否计入教程学习成绩：不计入
+第一次提交（旧版整卷提示）：25 题，答对 15 题，60%
+第二次提交（逐题 + 听写对齐）：25 题，答对 23 题，92%
+  选择题 13/15，听写 10/10
 ```
 
-机械链路已经完整跑通；60% 是这一轮答案质量的结果，AI/人工答案正确率越高，分数越高。
+课程只记录首次成绩，所以第二次的 92% 不会覆盖 60%；但同一份卷子上 runner 的答案正确率已经从 60% 提到 92%。
+
+选择题的剩余误差主要来自语义相近选项（如 "America is large..." vs "America has more tourist attractions than Europe"）；听写空位由原文对齐产出，基本不会改写。
 
 ## 已知限制
 
