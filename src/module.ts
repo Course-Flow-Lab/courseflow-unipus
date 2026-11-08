@@ -767,14 +767,93 @@ async function solveChoiceQuestions(session: string, group: any): Promise<Record
   return out;
 }
 
+function findQuestionGroup(decoded: any): any | null {
+  if (!decoded || typeof decoded !== 'object') return null;
+  for (const value of Object.values(decoded) as any[]) {
+    if (value && Array.isArray(value.questions)) return value;
+  }
+  return null;
+}
+
+function pageMeta(indexMap: any, pageId: string): { qid?: string; rules: any } {
+  let found: any = null;
+  const walk = (node: any) => {
+    if (!node || typeof node !== 'object' || found) return;
+    if (typeof node.qid === 'string') {
+      found = { qid: node.qid, rules: node.rules ?? [] };
+      return;
+    }
+    for (const value of Object.values(node)) walk(value);
+  };
+  walk(indexMap?.[pageId] ?? {});
+  return found ?? { rules: [] };
+}
+
+async function solveTextQuestions(session: string, group: any): Promise<Record<string, string[]> | null> {
+  const questions = (group.questions ?? []).map((question: any, index: number) => ({
+    id: String(index),
+    stem: stripHtml(question?.content?.html),
+  }));
+  if (questions.length === 0) return null;
+  const prompt = [
+    '你是 U校园英语练习答题助手。',
+    '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
+    '简答题/填空题给出简短、直接、符合题意的英文答案。',
+    JSON.stringify(questions),
+  ].join('\n');
+  let parsed: any = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await hostCall('cw.ai.generate', {
+      session,
+      prompt: attempt === 0 ? prompt : `${prompt}\n上次输出不是合法 JSON；这次只输出 JSON。`,
+    });
+    const raw = String((response as any)?.text ?? '').trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+    try {
+      parsed = JSON.parse(raw);
+      break;
+    } catch {
+      // retry
+    }
+  }
+  if (!Array.isArray(parsed)) return null;
+  const out: Record<string, string[]> = {};
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue;
+    const id = String(item.id ?? '');
+    const texts = Array.isArray(item.texts)
+      ? item.texts.map(String)
+      : Array.isArray(item.answers)
+        ? item.answers.map(String)
+        : [];
+    if (id) out[id] = texts;
+  }
+  return out;
+}
+
 async function studyTask(session: string, courseId: string, unit: any, auth: any) {
-  if (SETTINGS.enable_task_submit !== true) {
+  const groupId = String(unit.id ?? '').split('::')[0];
+  let minScorePct = 0;
+  let progressData: any = null;
+  try {
+    const progress = await fetchText(
+      session,
+      `${UCONTENT_BASE}/api/mobile/user_module/${courseId}/${groupId}/progress/v2/`,
+      annotatorHeaders(auth),
+    );
+    progressData = JSON.parse(progress.text)?.data ?? null;
+    minScorePct = Number(progressData?.flowStrategy?.task_mini_score_pct ?? 0);
+  } catch {
+    minScorePct = 0;
+  }
+  if (minScorePct > 0 && SETTINGS.enable_task_submit !== true) {
     return {
       status: 'needs_human',
-      reason: '题组自动提交默认关闭（提交结构仍在联调，避免写入 0 分尝试）',
+      reason: `题组有计分要求（min_score_pct=${minScorePct}），自动提交默认关闭`,
     };
   }
-  const groupId = String(unit.id ?? '').split('::')[0];
   const summary = await fetchText(
     session,
     `${UCONTENT_BASE}/course/api/pc/summary/${courseId}/${groupId}/default/`,
@@ -801,44 +880,53 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     contentJson = JSON.parse(content.text);
   } catch {}
   const decoded = decodeContent(contentJson);
-  const choice = findChoiceGroup(decoded);
-  if (!choice) {
-    return { status: 'needs_human', reason: '当前题型尚未支持自动提交（仅支持单选/判断）' };
+  const questionGroup = findQuestionGroup(decoded);
+  if (!questionGroup) {
+    return { status: 'needs_human', reason: '题组内容里没有题目' };
   }
-
-  const solved = await solveChoiceQuestions(session, choice.group);
+  const choice = findChoiceGroup(decoded);
+  const solved = choice
+    ? await solveChoiceQuestions(session, choice.group)
+    : await solveTextQuestions(session, questionGroup);
   if (!solved) {
-    return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
+    return { status: 'needs_human', reason: '模型没有返回可用的答案' };
   }
 
   const userState = await fetchUserState(session, courseId, groupId, auth);
+  const questions = questionGroup.questions ?? [];
   const answers: Record<string, any> = {};
-  const specificScores: any[] = [];
-  const questions = choice.group.questions ?? [];
   for (let index = 0; index < questions.length; index += 1) {
     const question = questions[index];
     const path = questionsList[index]?.path?.[0] ?? [];
     const pageId = String(path[1] ?? '');
-    const pageInfo = indexMap[pageId] ?? {};
-    const qid = pageInfo.qid;
-    const rules = pageInfo.rules ?? [];
-    const options = question.options ?? [];
+    const meta = pageMeta(indexMap, pageId);
+    const qid = meta.qid;
+    const ruleValue = Array.isArray(meta.rules) ? (meta.rules[index] ?? meta.rules[0]) : meta.rules;
     const texts = solved[String(index)] ?? [];
-    let optionIndex = options.findIndex((option: any) => {
-      const caption = String(option?.caption ?? '');
-      const text = stripHtml(option?.content?.html);
-      return texts.some((value) => value === caption || value === text || text.includes(value) || value.includes(text));
-    });
-    if (optionIndex < 0) optionIndex = 0;
-    const option = options[optionIndex] ?? {};
+    let answerValue: any;
+    if (choice) {
+      const options = question.options ?? [];
+      let optionIndex = options.findIndex((option: any) => {
+        const caption = String(option?.caption ?? '');
+        const text = stripHtml(option?.content?.html);
+        return texts.some((value) => value === caption || value === text || text.includes(value) || value.includes(text));
+      });
+      if (optionIndex < 0) optionIndex = 0;
+      answerValue = String(options[optionIndex]?.caption ?? 'A');
+    } else {
+      answerValue = texts[0] ?? 'Answered.';
+    }
     if (qid) {
       answers[String(index)] = {
+        isDone: true,
+        student_answer: { answers: answerValue },
         user_answer: {
           qid,
-          rule: rules,
+          rule: ruleValue,
           answer: {
-            index: optionIndex,
-            answer: String(option.caption ?? 'A'),
+            index,
+            answer: { student_answer: { answers: answerValue } },
+            version: 'v3',
           },
           content: '',
         },
@@ -846,16 +934,28 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     } else {
       answers[String(index)] = { score: 0 };
     }
-    specificScores[index] = null;
   }
 
+  const stateObj: any = {
+    version: String(userState?.state?.version ?? 'default'),
+    __EXTEND_DATA__: {
+      base: String(userState?.state?.__EXTEND_DATA__?.base ?? userState?.base ?? ''),
+      commit: String(userState?.state?.__EXTEND_DATA__?.commit ?? userState?.commit ?? ''),
+    },
+    __SUMMARY__: {
+      firstPass: {
+        score_pct: progressData?.first_pass?.score_pct ?? 1,
+        datetime: progressData?.first_pass?.datetime ?? 0,
+      },
+    },
+  };
   const payload = {
     enable_mistake: false,
     version: 'default',
-    record_version: String(userState?.state?.version ?? 'default'),
-    base: String(userState?.base ?? ''),
-    state: JSON.stringify(userState?.state ?? {}),
-    specific_scores: specificScores,
+    record_version: stateObj.version,
+    base: String(userState?.commit ?? userState?.base ?? ''),
+    state: JSON.stringify(stateObj),
+    specific_scores: questions.map(() => null),
     answers,
   };
   const submit = await hostFetchFor(session, 'save_study')(
@@ -883,23 +983,24 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
       reason: `题组提交失败：code ${submitJson?.code ?? '?'} ${submitJson?.message ?? submit.body.slice(0, 160)}`,
     };
   }
-  const result = decryptSubmitContent(submitJson?.data?.content);
-  const state = Number(result?.submit_info?.state?.state ?? 0);
-  const score = result?.submit_info?.score ?? result?.submit_info?.state?.score ?? null;
-  if (state === 1) {
+  const info = submitJson?.data?.submit_info;
+  const submitState = Number(info?.state?.state ?? 0);
+  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
+  const score = info?.state?.score ?? null;
+  const needed = Math.max(minScorePct, 0.6);
+  if (submitState === 1 && (minScorePct === 0 || scorePct >= needed)) {
     return {
       status: 'completed',
-      evidence: { platform_confirmed: true, score },
+      evidence: { platform_confirmed: true, score, score_pct: scorePct, min_score_pct: minScorePct },
       checkpoint: { phase: 'done' },
     };
   }
   return {
     status: 'needs_human',
-    reason: `题组已提交但平台未确认完成（score ${score ?? '?'}）`,
-    evidence: { score },
+    reason: `题组已提交但未达到通过条件（score_pct ${scorePct}, min ${minScorePct}）`,
+    evidence: { score, score_pct: scorePct, min_score_pct: minScorePct },
   };
 }
-
 async function studyStep(params: any) {
   const session = String(params.session ?? '');
   const unit = params.unit ?? {};
