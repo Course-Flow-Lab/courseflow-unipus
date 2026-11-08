@@ -606,7 +606,7 @@ function findChoiceGroup(decoded) {
   }
   return null;
 }
-async function solveChoiceQuestions(session, group) {
+async function solveChoiceQuestions(session, group, context = "") {
   const questions = (group.questions ?? []).map((question, index) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html),
@@ -616,12 +616,18 @@ async function solveChoiceQuestions(session, group) {
     }))
   }));
   if (questions.length === 0) return null;
+  const contextBlock = context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
+${context.trim()}
+` : "";
   const prompt = [
     "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
+    "\u6839\u636E\u542C\u529B/\u89C6\u9891\u539F\u6587\u548C\u9898\u76EE\u9009\u62E9\u6B63\u786E\u7B54\u6848\uFF1B\u539F\u6587\u6CA1\u6709\u8986\u76D6\u7684\u4FE1\u606F\u4E0D\u8981\u7F16\u9020\u3002",
     '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
     "\u9009\u62E9\u9898 texts \u8FD4\u56DE\u6B63\u786E\u9009\u9879\u7684 caption\uFF08A/B/C/D\uFF09\uFF0C\u5982\u679C\u4E0D\u786E\u5B9A caption\uFF0C\u8FD4\u56DE\u9009\u9879\u539F\u6587\u3002",
+    contextBlock,
     JSON.stringify(questions)
   ].join("\n");
+  if (context.trim()) log("info", `choice context ${context.trim().length} chars`);
   let parsed = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const response = await hostCall("cw.ai.generate", {
@@ -645,6 +651,59 @@ async function solveChoiceQuestions(session, group) {
     if (id) out[id] = texts;
   }
   return out;
+}
+function parseVtt(text) {
+  const out = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^WEBVTT/i.test(line) || /^NOTE\b/i.test(line) || /^\d+$/.test(line) || line.includes("-->")) continue;
+    const clean = stripHtml(line.replace(/<[^>]+>/g, " "));
+    if (!clean) continue;
+    if (out[out.length - 1] === clean) continue;
+    out.push(clean);
+  }
+  return out.join(" ");
+}
+async function collectStudyContext(session, decoded) {
+  const parts = [];
+  const seenVtt = /* @__PURE__ */ new Set();
+  if (!decoded || typeof decoded !== "object") return "";
+  for (const group of Object.values(decoded)) {
+    for (const content of group?.content ?? []) {
+      const script = content?.audio?.script;
+      const scriptHtml = typeof script === "string" ? script : script?.html;
+      if (scriptHtml) {
+        const text = stripHtml(scriptHtml);
+        if (text) parts.push(text);
+      }
+      const scoopHtml = content?.scoop?.html;
+      if (scoopHtml) {
+        const text = stripHtml(scoopHtml);
+        if (text) parts.push(text);
+      }
+      const videoFile = content?.video?.file;
+      if (typeof videoFile === "string" && /\.vtt(?:\?|#|$)/i.test(videoFile) && !seenVtt.has(videoFile)) {
+        seenVtt.add(videoFile);
+        try {
+          const { text } = await fetchText(session, videoFile, { accept: "*/*" }, "read");
+          const parsed = parseVtt(text);
+          if (parsed) parts.push(parsed);
+        } catch (error) {
+          log("warn", `vtt ${videoFile} failed: ${errorText(error)}`);
+        }
+      }
+    }
+  }
+  const unique = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const part of parts) {
+    const text = part.replace(/\s+/g, " ").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    unique.push(text);
+  }
+  return unique.join("\n\n").slice(0, 16e3);
 }
 function findQuestionGroup(decoded) {
   if (!decoded || typeof decoded !== "object") return null;
@@ -935,8 +994,9 @@ function choiceCaptions(group, solved) {
     return matchChoiceCaption(options, solved[String(index)] ?? []);
   });
 }
-async function studyChoiceBrowser(session, courseId, groupId, questionGroup, questionsList, auth, minScorePct) {
-  const solved = await solveChoiceQuestions(session, questionGroup);
+async function studyChoiceBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
+  const context = await collectStudyContext(session, decoded);
+  const solved = await solveChoiceQuestions(session, questionGroup, context);
   if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
   const captions = choiceCaptions(questionGroup, solved);
   const result = await browserStudy(
@@ -968,7 +1028,8 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
     }
   } else if (choice) {
     if (values.length === 0) {
-      const solved = await solveChoiceQuestions(session, choice.group);
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveChoiceQuestions(session, choice.group, context);
       if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
       values = choiceCaptions(choice.group, solved);
     }
@@ -1212,6 +1273,7 @@ async function studyTask(session, courseId, unit, auth) {
         session,
         courseId,
         groupId,
+        decoded,
         questionGroup,
         questionsList,
         auth,

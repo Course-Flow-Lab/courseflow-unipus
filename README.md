@@ -96,6 +96,8 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 注意：AI 返回 `"B"` 这类单字母时，只能按 `caption` 精确匹配。不能对选项原文做 `includes("B")`，否则 `"Because ..."` 会被误判成 B 选项。
 
+选择题现在会把 `content[].audio.script` 的听力原文、`content[].scoop.html` 的阅读材料和 `content[].video.file` 的 VTT 字幕一起注入模型 prompt，不再只靠题干和选项猜答案。没有原文的题组会退回只发题干和选项。
+
 ### 多页题组（Short conversations）
 
 多页题组和单页结构不同：

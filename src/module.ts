@@ -720,7 +720,11 @@ function findChoiceGroup(decoded: any): { group: any; category: string } | null 
   return null;
 }
 
-async function solveChoiceQuestions(session: string, group: any): Promise<Record<string, string[]> | null> {
+async function solveChoiceQuestions(
+  session: string,
+  group: any,
+  context = '',
+): Promise<Record<string, string[]> | null> {
   const questions = (group.questions ?? []).map((question: any, index: number) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html),
@@ -730,12 +734,18 @@ async function solveChoiceQuestions(session: string, group: any): Promise<Record
     })),
   }));
   if (questions.length === 0) return null;
+  const contextBlock = context.trim()
+    ? `听力/视频原文：\n${context.trim()}\n`
+    : '';
   const prompt = [
     '你是 U校园英语练习答题助手。',
+    '根据听力/视频原文和题目选择正确答案；原文没有覆盖的信息不要编造。',
     '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
     '选择题 texts 返回正确选项的 caption（A/B/C/D），如果不确定 caption，返回选项原文。',
+    contextBlock,
     JSON.stringify(questions),
   ].join('\n');
+  if (context.trim()) log('info', `choice context ${context.trim().length} chars`);
   let parsed: any = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const response = await hostCall('cw.ai.generate', {
@@ -766,6 +776,65 @@ async function solveChoiceQuestions(session: string, group: any): Promise<Record
     if (id) out[id] = texts;
   }
   return out;
+}
+
+function parseVtt(text: string): string {
+  const out: string[] = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^WEBVTT/i.test(line) || /^NOTE\b/i.test(line) || /^\d+$/.test(line) || line.includes('-->')) continue;
+    const clean = stripHtml(line.replace(/<[^>]+>/g, ' '));
+    if (!clean) continue;
+    if (out[out.length - 1] === clean) continue;
+    out.push(clean);
+  }
+  return out.join(' ');
+}
+
+async function collectStudyContext(session: string, decoded: any): Promise<string> {
+  const parts: string[] = [];
+  const seenVtt = new Set<string>();
+  if (!decoded || typeof decoded !== 'object') return '';
+  for (const group of Object.values(decoded) as any[]) {
+    for (const content of group?.content ?? []) {
+      const script = content?.audio?.script;
+      const scriptHtml = typeof script === 'string' ? script : script?.html;
+      if (scriptHtml) {
+        const text = stripHtml(scriptHtml);
+        if (text) parts.push(text);
+      }
+      const scoopHtml = content?.scoop?.html;
+      if (scoopHtml) {
+        const text = stripHtml(scoopHtml);
+        if (text) parts.push(text);
+      }
+      const videoFile = content?.video?.file;
+      if (
+        typeof videoFile === 'string' &&
+        /\.vtt(?:\?|#|$)/i.test(videoFile) &&
+        !seenVtt.has(videoFile)
+      ) {
+        seenVtt.add(videoFile);
+        try {
+          const { text } = await fetchText(session, videoFile, { accept: '*/*' }, 'read');
+          const parsed = parseVtt(text);
+          if (parsed) parts.push(parsed);
+        } catch (error) {
+          log('warn', `vtt ${videoFile} failed: ${errorText(error)}`);
+        }
+      }
+    }
+  }
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    const text = part.replace(/\s+/g, ' ').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    unique.push(text);
+  }
+  return unique.join('\n\n').slice(0, 16000);
 }
 
 function findQuestionGroup(decoded: any): any | null {
@@ -1100,12 +1169,14 @@ async function studyChoiceBrowser(
   session: string,
   courseId: string,
   groupId: string,
+  decoded: any,
   questionGroup: any,
   questionsList: any[],
   auth: any,
   minScorePct: number,
 ) {
-  const solved = await solveChoiceQuestions(session, questionGroup);
+  const context = await collectStudyContext(session, decoded);
+  const solved = await solveChoiceQuestions(session, questionGroup, context);
   if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
   const captions = choiceCaptions(questionGroup, solved);
   const result = await browserStudy(
@@ -1149,7 +1220,8 @@ async function studyObjectiveApi(
     }
   } else if (choice) {
     if (values.length === 0) {
-      const solved = await solveChoiceQuestions(session, choice.group);
+      const context = await collectStudyContext(session, decoded);
+      const solved = await solveChoiceQuestions(session, choice.group, context);
       if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
       values = choiceCaptions(choice.group, solved);
     }
@@ -1380,7 +1452,7 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     }
     if (BROWSER_STUDY) {
       const browserResult: any = await studyChoiceBrowser(
-        session, courseId, groupId, questionGroup, questionsList, auth, minScorePct,
+        session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
       );
       if (browserResult.status === 'completed') return browserResult;
       const rawState = browserResult?.evidence?.state;
