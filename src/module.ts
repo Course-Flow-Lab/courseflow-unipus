@@ -1044,7 +1044,11 @@ function pageMeta(indexMap: any, pageId: string): { qid?: string; rules: any } {
   return found ?? { rules: [] };
 }
 
-async function solveTextQuestions(session: string, group: any): Promise<Record<string, string[]> | null> {
+async function solveTextQuestions(
+  session: string,
+  group: any,
+  context = '',
+): Promise<Record<string, string[]> | null> {
   const questions = (group.questions ?? []).map((question: any, index: number) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html),
@@ -1054,6 +1058,7 @@ async function solveTextQuestions(session: string, group: any): Promise<Record<s
     '你是 U校园英语练习答题助手。',
     '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
     '简答题/填空题给出简短、直接、符合题意的英文答案。',
+    context.trim() ? `听力/视频原文：\n${context.trim()}` : '',
     JSON.stringify(questions),
   ].join('\n');
   let parsed: any = null;
@@ -1548,6 +1553,132 @@ async function studyObjectiveApi(
   };
 }
 
+function isShortAnswerTask(category: string, decoded: any): boolean {
+  if (category === 'shortanswerscoop') return true;
+  const keys = Object.keys(decoded ?? {});
+  return keys.some((key) => key === 'shortanswer:shortanswer' || key === 'questions:shortanswer');
+}
+
+function isOralTask(decoded: any): boolean {
+  const keys = Object.keys(decoded ?? {});
+  return keys.some(
+    (key) =>
+      /^(roleplay|presentation):/.test(key) ||
+      /sentencesforrecord|individualpresentation-course/i.test(key),
+  );
+}
+
+async function studyShortAnswerApi(
+  session: string,
+  courseId: string,
+  groupId: string,
+  decoded: any,
+  questionGroup: any,
+  questionsList: any[],
+  indexMap: any,
+  auth: any,
+  minScorePct: number,
+) {
+  const category = String(questionGroup.category ?? '').toLowerCase();
+  const questions = questionGroup.questions ?? [];
+  if (questions.length === 0) return { status: 'needs_human', reason: '短答题没有题目' };
+  const context = await collectStudyContext(session, decoded);
+  const solved = await solveTextQuestions(session, questionGroup, context);
+  if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的短答题答案' };
+  const values = questions.map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
+  if (values.every((value: string) => !value.trim())) {
+    return { status: 'needs_human', reason: '短答题没有生成有效答案' };
+  }
+
+  const userState = await fetchUserState(session, courseId, groupId, auth);
+  const version = String(
+    userState?.state?.version ?? userState?.version ?? Math.floor(Date.now() / 1000),
+  );
+  const firstQid = collectQids(indexMap)[0];
+  if (!firstQid) return { status: 'needs_human', reason: '题组没有返回 qid' };
+  const pageId = String(questionsList?.[0]?.path?.[0]?.[1] ?? 'p_1');
+  const meta = pageMeta(indexMap, pageId);
+  const qid = meta.qid ?? firstQid;
+  const keys = Object.keys(decoded ?? {});
+  const component =
+    category === 'shortanswerscoop' || keys.some((key) => /^shortanswer:/.test(key))
+      ? 'c_1_1'
+      : 'c_1_0';
+
+  const studentAnswers: Record<string, string> = {};
+  const answerList: Record<string, any> = {};
+  const answers: Record<string, any> = {};
+  for (let index = 0; index < questions.length; index += 1) {
+    const value = values[index] ?? '';
+    studentAnswers[String(index)] = value;
+    answerList[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: 'v2',
+      rule: 'subjective',
+    };
+    answers[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: 'v2',
+      rule: 'subjective',
+    };
+  }
+  const stateObj = {
+    version,
+    [pageId]: { [component]: { student_answers: studentAnswers } },
+    __EXTEND_DATA__: { __SUMMARY__: { answerList } },
+  };
+  const payload = {
+    enable_mistake: false,
+    version: 'default',
+    record_version: version,
+    state: JSON.stringify(stateObj),
+    specific_scores: questions.map(() => null),
+    answers,
+  };
+  const submit = await hostFetchFor(session, 'save_study')(
+    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
+    {
+      method: 'POST',
+      headers: {
+        ...BROWSER_HEADERS,
+        ...annotatorHeaders(auth),
+        'content-type': 'application/json',
+        origin: UCONTENT_BASE,
+        referer: `${UCONTENT_BASE}/_pc_default/pc.html`,
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+  let submitJson: any = null;
+  try {
+    submitJson = JSON.parse(submit.body);
+  } catch {}
+  log('info', `submit shortanswer ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? '?'}`);
+  if (submitJson?.code !== 0) {
+    return {
+      status: 'needs_human',
+      reason: `短答题提交失败：code ${submitJson?.code ?? '?'} ${submitJson?.msg ?? submit.body.slice(0, 160)}`,
+    };
+  }
+  const info = submitJson?.data?.submit_info;
+  const submitState = Number(info?.state?.state ?? 0);
+  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
+  if (submitState === 1 && (minScorePct === 0 || scorePct >= minScorePct)) {
+    return {
+      status: 'completed',
+      evidence: { platform_confirmed: true, subjective: true, score_pct: scorePct },
+      checkpoint: { phase: 'done' },
+    };
+  }
+  return {
+    status: 'needs_human',
+    reason: `短答题已提交但平台未确认（state ${submitState}, score_pct ${scorePct}）`,
+    evidence: { state: submitState, score_pct: scorePct },
+  };
+}
+
 async function studyTask(session: string, courseId: string, unit: any, auth: any) {
   const groupId = String(unit.id ?? '').split('::')[0];
   let minScorePct = 0;
@@ -1613,6 +1744,9 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     contentJson = JSON.parse(content.text);
   } catch {}
   const decoded = decodeContent(contentJson);
+  if (isOralTask(decoded)) {
+    return { status: 'needs_human', reason: '口语/录音题，需要人工完成' };
+  }
   const questionGroup = findQuestionGroup(decoded);
   if (!questionGroup) {
     return { status: 'needs_human', reason: '题组内容里没有题目' };
@@ -1693,121 +1827,20 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     return { status: 'needs_human', reason: '排序/多选题会计分，自动提交默认关闭' };
   }
 
-  const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
-  if (objective && SETTINGS.enable_task_submit !== true) {
+  if (isShortAnswerTask(category, decoded)) {
+    return studyShortAnswerApi(
+      session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct,
+    );
+  }
+  if (isOralTask(decoded)) {
     return {
       status: 'needs_human',
-      reason: `客观题（${category || 'unknown'}）会计分，自动提交默认关闭`,
-    };
-  }
-  const choice = objective ? findChoiceGroup(decoded) : null;
-  const solved = choice
-    ? await solveChoiceQuestions(session, choice.group)
-    : await solveTextQuestions(session, questionGroup);
-  if (!solved) {
-    return { status: 'needs_human', reason: '模型没有返回可用的答案' };
-  }
-
-  const userState = await fetchUserState(session, courseId, groupId, auth);
-  const questions = questionGroup.questions ?? [];
-  const answers: Record<string, any> = {};
-  for (let index = 0; index < questions.length; index += 1) {
-    const question = questions[index];
-    const path = questionsList[index]?.path?.[0] ?? [];
-    const pageId = String(path[1] ?? '');
-    const meta = pageMeta(indexMap, pageId);
-    const qid = meta.qid;
-    const ruleValue = Array.isArray(meta.rules) ? (meta.rules[index] ?? meta.rules[0]) : meta.rules;
-    const texts = solved[String(index)] ?? [];
-    let answerValue: any;
-    if (choice) {
-      answerValue = matchChoiceCaption(question.options ?? [], texts);
-    } else {
-      answerValue = texts[0] ?? 'Answered.';
-    }
-    if (qid) {
-      answers[String(index)] = {
-        isDone: true,
-        student_answer: { answers: answerValue },
-        user_answer: {
-          qid,
-          rule: ruleValue,
-          answer: {
-            index,
-            answer: { student_answer: { answers: answerValue } },
-            version: 'v3',
-          },
-          content: '',
-        },
-      };
-    } else {
-      answers[String(index)] = { score: 0 };
-    }
-  }
-
-  const stateObj: any = {
-    version: String(userState?.state?.version ?? 'default'),
-    __EXTEND_DATA__: {
-      base: String(userState?.state?.__EXTEND_DATA__?.base ?? userState?.base ?? ''),
-      commit: String(userState?.state?.__EXTEND_DATA__?.commit ?? userState?.commit ?? ''),
-    },
-    __SUMMARY__: {
-      firstPass: {
-        score_pct: progressData?.first_pass?.score_pct ?? 1,
-        datetime: progressData?.first_pass?.datetime ?? 0,
-      },
-    },
-  };
-  const payload = {
-    enable_mistake: false,
-    version: 'default',
-    record_version: stateObj.version,
-    base: String(userState?.commit ?? userState?.base ?? ''),
-    state: JSON.stringify(stateObj),
-    specific_scores: questions.map(() => null),
-    answers,
-  };
-  const submit = await hostFetchFor(session, 'save_study')(
-    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
-    {
-      method: 'POST',
-      headers: {
-        ...BROWSER_HEADERS,
-        ...annotatorHeaders(auth),
-        'content-type': 'application/json',
-        origin: UCONTENT_BASE,
-        referer: `${UCONTENT_BASE}/_pc_default/pc.html`,
-      },
-      body: JSON.stringify(payload),
-    },
-  );
-  let submitJson: any = null;
-  try {
-    submitJson = JSON.parse(submit.body);
-  } catch {}
-  log('info', `submit ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? '?'}`);
-  if (submitJson?.code !== 0) {
-    return {
-      status: 'needs_human',
-      reason: `题组提交失败：code ${submitJson?.code ?? '?'} ${submitJson?.message ?? submit.body.slice(0, 160)}`,
-    };
-  }
-  const info = submitJson?.data?.submit_info;
-  const submitState = Number(info?.state?.state ?? 0);
-  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
-  const score = info?.state?.score ?? null;
-  const needed = Math.max(minScorePct, 0.6);
-  if (submitState === 1 && (minScorePct === 0 || scorePct >= needed)) {
-    return {
-      status: 'completed',
-      evidence: { platform_confirmed: true, score, score_pct: scorePct, min_score_pct: minScorePct },
-      checkpoint: { phase: 'done' },
+      reason: '口语/录音题，需要人工完成',
     };
   }
   return {
     status: 'needs_human',
-    reason: `题组已提交但未达到通过条件（score_pct ${scorePct}, min ${minScorePct}）`,
-    evidence: { score, score_pct: scorePct, min_score_pct: minScorePct },
+    reason: `未支持的任务类型（${category || Object.keys(decoded ?? {}).join(',') || 'unknown'}）`,
   };
 }
 async function studyStep(params: any) {

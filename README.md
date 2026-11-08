@@ -11,7 +11,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 课程目录页解析 `course_v1` 课程 ID
 - 课程树 + 每个 Unit 的 `course_progress`，映射成阅读/视频/题组单元
 
-现在已跑通单页、多页、排序/匹配和多选客观题的完整链路：
+现在已跑通单页、多页、排序/匹配、多选、短答和表格短答的完整链路：
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
 - 题组提交：`POST /course/api/v3/submit/<course>/<group>/`，真实 envelope 已对齐
@@ -172,6 +172,44 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 `u4g624` 的本地状态结构已通过页面 `saveAnswer` 验证；但它是 required 任务，而且音频没有 `script`/VTT，尚未做真实提交，避免首次得分锁成 0。
 
+### 短答题 `shortanswer` / `shortanswerScoop`
+
+短答题按“主观题”处理，规则是 `subjective`：
+
+```json
+"p_1": {
+  "c_1_1": {
+    "student_answers": {
+      "0": "answer one",
+      "1": "answer two"
+    }
+  }
+}
+```
+
+- 单题 `shortanswer:shortanswer` 用 `c_1_1`
+- 多题 `questions:shortanswer` 用 `c_1_0`
+- 表格型 `shortanswerScoop` 用 `c_1_1`
+- `answerList` 和 `answers` 的 `student_answer` 都是字符串
+- 不要求正确率，提交后 `state=1`、`score_pct=1`
+
+实测：
+
+- `u3g139`（单题短答）：100
+- `u2g85`（多题短答）：100
+- `u2g110`（表格短答 8 空）：100
+
+### 口语 / 录音题策略
+
+这些类型明确返回 `needs_human`，不再尝试自动提交：
+
+- `roleplay:roleplay`
+- `presentation:individualpresentation-course`
+- `sentencesforrecord`
+- `individualpresentation-course`
+
+原因是需要录音/音频上传，当前模块不做伪提交，避免把任务状态写坏。
+
 ## Playwright 浏览器提交（已验证）
 
 用 Edge 远程调试（`--remote-debugging-port=9222`）+ Playwright `connectOverCDP`，通过模块的 `cw.browser` 已完成：
@@ -213,6 +251,7 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 多页题组、排序题、多选题都走 API 自动提交；浏览器路径仍只用于单页单选/填空。
 - ASR 是本地 CPU 转写，2.5 分钟音频约 20 秒；如果框架调用预算更紧，可把 `asr_model` 改成 `tiny.en`，或提前把模型缓存好。
 - ASR 依赖 `python`、`faster-whisper`、`ffmpeg`；模块安装时会把 `scripts/transcribe_audio.py` 一起复制。
+- 口语/录音题（roleplay、presentation、sentencesforrecord）不做自动提交，统一返回 `needs_human`。
 
 ## 安装
 

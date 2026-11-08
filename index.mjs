@@ -603,17 +603,6 @@ async function fetchUserState(session, courseId, groupId, auth) {
     return null;
   }
 }
-function findChoiceGroup(decoded) {
-  if (!decoded || typeof decoded !== "object") return null;
-  for (const value of Object.values(decoded)) {
-    if (!value || !Array.isArray(value.questions)) continue;
-    const category = String(value.category ?? "");
-    if (category === "singlechoice" || category === "truefalse" || category === "choice") {
-      return { group: value, category };
-    }
-  }
-  return null;
-}
 async function solveChoiceQuestions(session, group, context = "") {
   const questions = (group.questions ?? []).map((question, index) => ({
     id: String(index),
@@ -886,7 +875,7 @@ function pageMeta(indexMap, pageId) {
   walk(indexMap?.[pageId] ?? {});
   return found ?? { rules: [] };
 }
-async function solveTextQuestions(session, group) {
+async function solveTextQuestions(session, group, context = "") {
   const questions = (group.questions ?? []).map((question, index) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html)
@@ -896,6 +885,8 @@ async function solveTextQuestions(session, group) {
     "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
     '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
     "\u7B80\u7B54\u9898/\u586B\u7A7A\u9898\u7ED9\u51FA\u7B80\u77ED\u3001\u76F4\u63A5\u3001\u7B26\u5408\u9898\u610F\u7684\u82F1\u6587\u7B54\u6848\u3002",
+    context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
+${context.trim()}` : "",
     JSON.stringify(questions)
   ].join("\n");
   let parsed = null;
@@ -1324,6 +1315,113 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
     evidence: { score, score_pct: scorePct, min_score_pct: minScorePct }
   };
 }
+function isShortAnswerTask(category, decoded) {
+  if (category === "shortanswerscoop") return true;
+  const keys = Object.keys(decoded ?? {});
+  return keys.some((key) => key === "shortanswer:shortanswer" || key === "questions:shortanswer");
+}
+function isOralTask(decoded) {
+  const keys = Object.keys(decoded ?? {});
+  return keys.some(
+    (key) => /^(roleplay|presentation):/.test(key) || /sentencesforrecord|individualpresentation-course/i.test(key)
+  );
+}
+async function studyShortAnswerApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct) {
+  const category = String(questionGroup.category ?? "").toLowerCase();
+  const questions = questionGroup.questions ?? [];
+  if (questions.length === 0) return { status: "needs_human", reason: "\u77ED\u7B54\u9898\u6CA1\u6709\u9898\u76EE" };
+  const context = await collectStudyContext(session, decoded);
+  const solved = await solveTextQuestions(session, questionGroup, context);
+  if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u77ED\u7B54\u9898\u7B54\u6848" };
+  const values = questions.map((_, index) => solved[String(index)]?.[0] ?? "");
+  if (values.every((value) => !value.trim())) {
+    return { status: "needs_human", reason: "\u77ED\u7B54\u9898\u6CA1\u6709\u751F\u6210\u6709\u6548\u7B54\u6848" };
+  }
+  const userState = await fetchUserState(session, courseId, groupId, auth);
+  const version = String(
+    userState?.state?.version ?? userState?.version ?? Math.floor(Date.now() / 1e3)
+  );
+  const firstQid = collectQids(indexMap)[0];
+  if (!firstQid) return { status: "needs_human", reason: "\u9898\u7EC4\u6CA1\u6709\u8FD4\u56DE qid" };
+  const pageId = String(questionsList?.[0]?.path?.[0]?.[1] ?? "p_1");
+  const meta = pageMeta(indexMap, pageId);
+  const qid = meta.qid ?? firstQid;
+  const keys = Object.keys(decoded ?? {});
+  const component = category === "shortanswerscoop" || keys.some((key) => /^shortanswer:/.test(key)) ? "c_1_1" : "c_1_0";
+  const studentAnswers = {};
+  const answerList = {};
+  const answers = {};
+  for (let index = 0; index < questions.length; index += 1) {
+    const value = values[index] ?? "";
+    studentAnswers[String(index)] = value;
+    answerList[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: "v2",
+      rule: "subjective"
+    };
+    answers[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: "v2",
+      rule: "subjective"
+    };
+  }
+  const stateObj = {
+    version,
+    [pageId]: { [component]: { student_answers: studentAnswers } },
+    __EXTEND_DATA__: { __SUMMARY__: { answerList } }
+  };
+  const payload = {
+    enable_mistake: false,
+    version: "default",
+    record_version: version,
+    state: JSON.stringify(stateObj),
+    specific_scores: questions.map(() => null),
+    answers
+  };
+  const submit = await hostFetchFor(session, "save_study")(
+    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
+    {
+      method: "POST",
+      headers: {
+        ...BROWSER_HEADERS,
+        ...annotatorHeaders(auth),
+        "content-type": "application/json",
+        origin: UCONTENT_BASE,
+        referer: `${UCONTENT_BASE}/_pc_default/pc.html`
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+  let submitJson = null;
+  try {
+    submitJson = JSON.parse(submit.body);
+  } catch {
+  }
+  log("info", `submit shortanswer ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? "?"}`);
+  if (submitJson?.code !== 0) {
+    return {
+      status: "needs_human",
+      reason: `\u77ED\u7B54\u9898\u63D0\u4EA4\u5931\u8D25\uFF1Acode ${submitJson?.code ?? "?"} ${submitJson?.msg ?? submit.body.slice(0, 160)}`
+    };
+  }
+  const info = submitJson?.data?.submit_info;
+  const submitState = Number(info?.state?.state ?? 0);
+  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
+  if (submitState === 1 && (minScorePct === 0 || scorePct >= minScorePct)) {
+    return {
+      status: "completed",
+      evidence: { platform_confirmed: true, subjective: true, score_pct: scorePct },
+      checkpoint: { phase: "done" }
+    };
+  }
+  return {
+    status: "needs_human",
+    reason: `\u77ED\u7B54\u9898\u5DF2\u63D0\u4EA4\u4F46\u5E73\u53F0\u672A\u786E\u8BA4\uFF08state ${submitState}, score_pct ${scorePct}\uFF09`,
+    evidence: { state: submitState, score_pct: scorePct }
+  };
+}
 async function studyTask(session, courseId, unit, auth) {
   const groupId = String(unit.id ?? "").split("::")[0];
   let minScorePct = 0;
@@ -1390,6 +1488,9 @@ async function studyTask(session, courseId, unit, auth) {
   } catch {
   }
   const decoded = decodeContent(contentJson);
+  if (isOralTask(decoded)) {
+    return { status: "needs_human", reason: "\u53E3\u8BED/\u5F55\u97F3\u9898\uFF0C\u9700\u8981\u4EBA\u5DE5\u5B8C\u6210" };
+  }
   const questionGroup = findQuestionGroup(decoded);
   if (!questionGroup) {
     return { status: "needs_human", reason: "\u9898\u7EC4\u5185\u5BB9\u91CC\u6CA1\u6709\u9898\u76EE" };
@@ -1499,118 +1600,28 @@ async function studyTask(session, courseId, unit, auth) {
     }
     return { status: "needs_human", reason: "\u6392\u5E8F/\u591A\u9009\u9898\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
   }
-  const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
-  if (objective && SETTINGS.enable_task_submit !== true) {
+  if (isShortAnswerTask(category, decoded)) {
+    return studyShortAnswerApi(
+      session,
+      courseId,
+      groupId,
+      decoded,
+      questionGroup,
+      questionsList,
+      indexMap,
+      auth,
+      minScorePct
+    );
+  }
+  if (isOralTask(decoded)) {
     return {
       status: "needs_human",
-      reason: `\u5BA2\u89C2\u9898\uFF08${category || "unknown"}\uFF09\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED`
-    };
-  }
-  const choice = objective ? findChoiceGroup(decoded) : null;
-  const solved = choice ? await solveChoiceQuestions(session, choice.group) : await solveTextQuestions(session, questionGroup);
-  if (!solved) {
-    return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u7B54\u6848" };
-  }
-  const userState = await fetchUserState(session, courseId, groupId, auth);
-  const questions = questionGroup.questions ?? [];
-  const answers = {};
-  for (let index = 0; index < questions.length; index += 1) {
-    const question = questions[index];
-    const path = questionsList[index]?.path?.[0] ?? [];
-    const pageId = String(path[1] ?? "");
-    const meta = pageMeta(indexMap, pageId);
-    const qid = meta.qid;
-    const ruleValue = Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules;
-    const texts = solved[String(index)] ?? [];
-    let answerValue;
-    if (choice) {
-      answerValue = matchChoiceCaption(question.options ?? [], texts);
-    } else {
-      answerValue = texts[0] ?? "Answered.";
-    }
-    if (qid) {
-      answers[String(index)] = {
-        isDone: true,
-        student_answer: { answers: answerValue },
-        user_answer: {
-          qid,
-          rule: ruleValue,
-          answer: {
-            index,
-            answer: { student_answer: { answers: answerValue } },
-            version: "v3"
-          },
-          content: ""
-        }
-      };
-    } else {
-      answers[String(index)] = { score: 0 };
-    }
-  }
-  const stateObj = {
-    version: String(userState?.state?.version ?? "default"),
-    __EXTEND_DATA__: {
-      base: String(userState?.state?.__EXTEND_DATA__?.base ?? userState?.base ?? ""),
-      commit: String(userState?.state?.__EXTEND_DATA__?.commit ?? userState?.commit ?? "")
-    },
-    __SUMMARY__: {
-      firstPass: {
-        score_pct: progressData?.first_pass?.score_pct ?? 1,
-        datetime: progressData?.first_pass?.datetime ?? 0
-      }
-    }
-  };
-  const payload = {
-    enable_mistake: false,
-    version: "default",
-    record_version: stateObj.version,
-    base: String(userState?.commit ?? userState?.base ?? ""),
-    state: JSON.stringify(stateObj),
-    specific_scores: questions.map(() => null),
-    answers
-  };
-  const submit = await hostFetchFor(session, "save_study")(
-    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
-    {
-      method: "POST",
-      headers: {
-        ...BROWSER_HEADERS,
-        ...annotatorHeaders(auth),
-        "content-type": "application/json",
-        origin: UCONTENT_BASE,
-        referer: `${UCONTENT_BASE}/_pc_default/pc.html`
-      },
-      body: JSON.stringify(payload)
-    }
-  );
-  let submitJson = null;
-  try {
-    submitJson = JSON.parse(submit.body);
-  } catch {
-  }
-  log("info", `submit ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? "?"}`);
-  if (submitJson?.code !== 0) {
-    return {
-      status: "needs_human",
-      reason: `\u9898\u7EC4\u63D0\u4EA4\u5931\u8D25\uFF1Acode ${submitJson?.code ?? "?"} ${submitJson?.message ?? submit.body.slice(0, 160)}`
-    };
-  }
-  const info = submitJson?.data?.submit_info;
-  const submitState = Number(info?.state?.state ?? 0);
-  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
-  const score = info?.state?.score ?? null;
-  const needed = Math.max(minScorePct, 0.6);
-  if (submitState === 1 && (minScorePct === 0 || scorePct >= needed)) {
-    return {
-      status: "completed",
-      evidence: { platform_confirmed: true, score, score_pct: scorePct, min_score_pct: minScorePct },
-      checkpoint: { phase: "done" }
+      reason: "\u53E3\u8BED/\u5F55\u97F3\u9898\uFF0C\u9700\u8981\u4EBA\u5DE5\u5B8C\u6210"
     };
   }
   return {
     status: "needs_human",
-    reason: `\u9898\u7EC4\u5DF2\u63D0\u4EA4\u4F46\u672A\u8FBE\u5230\u901A\u8FC7\u6761\u4EF6\uFF08score_pct ${scorePct}, min ${minScorePct}\uFF09`,
-    evidence: { score, score_pct: scorePct, min_score_pct: minScorePct }
+    reason: `\u672A\u652F\u6301\u7684\u4EFB\u52A1\u7C7B\u578B\uFF08${category || Object.keys(decoded ?? {}).join(",") || "unknown"}\uFF09`
   };
 }
 async function studyStep(params) {
