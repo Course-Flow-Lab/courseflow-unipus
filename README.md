@@ -11,75 +11,43 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 - 课程目录页解析 `course_v1` 课程 ID
 - 课程树 + 每个 Unit 的 `course_progress`，映射成阅读/视频/题组单元
 
-联调中：
+现在已跑通客观题的完整链路：
 
 - 题组：`summary` 取 qid、`/course/api/v3/content` 解密题面与参考解析
-- 题组提交：已抓到真实 envelope：
-  ```json
-  {
-    "enable_mistake": false,
-    "version": "default",
-    "record_version": "<user_module.state.version>",
-    "base": "<user_module.commit>",
-    "state": "<JSON 字符串>",
-    "specific_scores": [null, null],
-    "answers": { "0": { "score": 0 } }
-  }
-  ```
-  空答案提交可以成功；带 `user_answer` 的答案结构已确认到：
-  ```json
-  {
-    "user_answer": {
-      "qid": "...",
-      "rule": "eq",
-      "answer": {
-        "index": 0,
-        "answer": { "student_answer": { "answers": "A" } },
-        "version": "v3"
-      },
-      "content": ""
-    }
-  }
-  ```
-  但真正计分还依赖 `scoreType`、`question_type`、`versions` 等元数据；目前提交后 `real_score_pct` 仍为 0。
-- 平台默认按“首次得分”记录（`record_every_submit=false`、`record_max_submit=false`），所以“先乱填、再按标准答案重交”无法把分数改回来。
+- 题组提交：`POST /course/api/v3/submit/<course>/<group>/`，真实 envelope 已对齐
+- 首次提交即可拿满分，不再依赖空提交或补交
+- 平台默认按“首次得分”记录（`record_every_submit=false`、`record_max_submit=false`），所以第一次提交必须用正确答案
 - 处理策略：
-  - 判断题、选择题、填空题属于**客观题**，会计分；默认暂停自动提交。
-  - 简答题、写作、翻译等**主观题**才按“写了就行”处理：自动提交文本并标记完成。
-  - `task_mini_score_pct = 0` 只表示该任务“交了就算过”，不代表分数不计入课程成绩。
-  - 客观题只有设置 `enable_task_submit: true` 且能提供答案时才自动提交。
+  - 判断题、选择题、填空题属于**客观题**，会计分；默认走浏览器或显式 API 提交
+  - 简答题、写作、翻译等**主观题**才按“写了就行”处理：自动提交文本并标记完成
+  - `task_mini_score_pct = 0` 只表示该任务“交了就算过”，不代表分数不计入课程成绩
+  - 客观题 API 提交需要设置 `enable_task_submit: true`；浏览器提交由 `browser_study` 控制
 
 实测：u2g72（简答）提交后 `pass=1`；u2g76、u2g567 属于客观题，即使 `pass=1` 也会记录 0 分。
 
-## 已知硬限制：Flash 录音器遮罩
+## study flow 初始化（已确认）
 
-这套视听说课件在题目页会加载 Flash 录音器组件，并弹出 `bfg-mask` 遮罩（提示“Flash 版本过低/正在下载 Flash 录音器”）。在无头 Chromium 里：
+打开课件页**不会**创建 `user_module`。平台在首次提交时由前端生成 `version`（Unix 秒级时间戳），直接带进提交体：
 
-- 遮罩会拦截选项和提交按钮的点击；
-- 即使绕过遮罩、把输入框填好，点“提交”也只会弹 Flash 提示，不会发出 `/course/api/v3/submit` 请求；
-- 因此音频类客观题目前无法在纯 HTTP 或无头浏览器里完成自动交卷。
+- `record_version` = 当前时间戳
+- `state.version` = 同一个时间戳
+- 没有 `base` 字段
+- 提交成功后服务端才创建 `user_module`，并回写 `progress/v2`
 
-阅读和视频节点不依赖该录音器，仍可正常自动完成。
+如果 `user_module` 已存在，则复用 `data.state.version`。所以不需要额外的 init 请求。
 
-## Playwright 真实提交（已验证）
+## 答题与提交结构（已实测）
 
-用 Edge 远程调试（`--remote-debugging-port=9222`）+ Playwright `connectOverCDP`，在真实 Edge 里完成了 u2g126：
+### 填空题 `fillblankScoop`
 
-1. 打开课件页；
-2. 删除 `.bfg-mask` / tooltip 遮罩；
-3. 用原生 setter 填输入框并派发 `input`/`change`；
-4. 点最后一个 `button.submit-bar-pc--btn`（提交）；
-5. 在“小U只记录你第一次答题的得分”弹窗里点 **确认**（不是“确定”）；
-6. 平台返回 `code 0`，回读 `score_avg=100`、`state=1`，页面显示「是否计入教程学习成绩：不计入」。
-
-抓到的 fillblankScoop 提交结构：
+答案从 `content[].audio.script` 的下划线 `<span style="text-decoration: underline">` 提取。
 
 ```json
 {
   "enable_mistake": false,
   "version": "default",
-  "record_version": "<user_module.state.version>",
-  "state": "{\"version\":\"...\",\"p_1\":{\"c_1_1\":{\"student_answers\":{\"0\":\"...\"}}},\"__EXTEND_DATA__\":{\"__SUMMARY__\":{\"answerList\":{\"0\":{\"student_answer\":\"...\",\"isDone\":true,\"version\":\"v2\",\"rule\":\"in\"}}}}}",
+  "record_version": "<version>",
+  "state": "{\"version\":\"<version>\",\"p_1\":{\"c_1_1\":{\"student_answers\":{\"0\":\"...\"}}},\"__EXTEND_DATA__\":{\"__SUMMARY__\":{\"answerList\":{\"0\":{\"student_answer\":\"...\",\"isDone\":true,\"version\":\"v2\",\"rule\":\"in\"}}}}}",
   "specific_scores": [null, ...],
   "answers": {
     "0": {
@@ -100,7 +68,55 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 }
 ```
 
-fillblankScoop 的答案还能直接从 `content[].audio.script` 的下划线 span 提取。
+### 单选 / 判断 `singlechoice`
+
+判断题也是 `singlechoice`，只是选项固定为 `A=True`、`B=False`。结构相同，`rule` 为 `eq`，答案为选项字母。
+
+```json
+{
+  "state": "{\"version\":\"<version>\",\"p_1\":{\"c_1_1\":{\"student_answers\":{\"0\":\"D\",\"1\":\"B\"}}},\"__EXTEND_DATA__\":{\"__SUMMARY__\":{\"answerList\":{\"0\":{\"student_answer\":\"D\",\"isDone\":true,\"version\":\"v2\",\"rule\":\"eq\"},\"1\":{\"student_answer\":\"B\",\"isDone\":true,\"version\":\"v2\",\"rule\":\"eq\"}}}}}",
+  "answers": {
+    "0": {
+      "student_answer": "D",
+      "isDone": true,
+      "version": "v2",
+      "rule": "eq",
+      "user_answer": {
+        "qid": "...",
+        "rule": "eq",
+        "answer": { "index": 0, "answer": "D", "version": "v2" },
+        "content": "",
+        "id": "<qid>-0",
+        "offset": 0
+      }
+    }
+  }
+}
+```
+
+注意：AI 返回 `"B"` 这类单字母时，只能按 `caption` 精确匹配。不能对选项原文做 `includes("B")`，否则 `"Because ..."` 会被误判成 B 选项。
+
+## Playwright 浏览器提交（已验证）
+
+用 Edge 远程调试（`--remote-debugging-port=9222`）+ Playwright `connectOverCDP`，通过模块的 `cw.browser` 已完成：
+
+- u7g453（fillblankScoop，10 空）：100 分
+- u3g191（singlechoice，2 题）：100 分
+
+纯 API 路径（`browser_study=false` + `enable_task_submit=true`）也已完成：
+
+- u4g254（fillblankScoop，10 空，required）：100 分
+- u3g192（singlechoice，2 题）：100 分
+
+流程：
+
+1. 打开课件页；
+2. 删除 `.bfg-mask`，点“我知道了”关闭新手指引；
+3. 点任务提示里的“确定”（“本单元学习时间/是否必修”弹窗），否则提交按钮只弹提示；
+4. 填空用原生 setter 写值并派发 `input`/`change`/`blur`；选择题按 `input[type=radio]` 的 `name` 分组，再按答案字母点对应 `label`；
+5. 点最后一个 `button.submit-bar-pc--btn`（提交）；
+6. 在“小U只记录你第一次答题的得分”弹窗里点 **确认**（不是“确定”）；
+7. 平台返回 `code 0`，回读 `score_avg=100`、`state=1`。
 
 已确认可用：
 
@@ -111,6 +127,8 @@ fillblankScoop 的答案还能直接从 `content[].audio.script` 的下划线 sp
 
 - 平台强制单会话：账号在手机/其他浏览器登录时，`getToken` 会 302 到 `repeatLogin`，模块返回 `platform_session_conflict`。需要先在官方页面退出，或让模块自动把其他会话踢下线。
 - 写入有频率限制（`600001/600002 操作过于频繁`），模块返回 `in_progress`，需要等几分钟再继续。
+- 题组有开放时间：`flowStrategy.startTime` 未到时平台会提示“学习开始时间未到，不能提交”；模块在打开浏览器前直接返回 `blocked`，不会白白消耗首次得分。
+- 首次得分锁定：`record_every_submit=false`、`record_max_submit=false`，第一次提交必须用正确答案。
 
 ## 安装
 
@@ -140,6 +158,8 @@ npm run cli -- module config unipus_classic '{
 | `course_id` | 可选，直接指定 `course-v1:...`，跳过目录页解析 |
 | `base_url` | 默认 `https://u.unipus.cn` |
 | `content_base_url` | 默认 `https://ucontent.unipus.cn` |
+| `browser_study` | 默认 `true`；用官方浏览器（Playwright/CDP）做客观题 |
+| `enable_task_submit` | 默认 `false`；`browser_study=false` 时允许走 API 提交客观题 |
 
 ## 协议要点
 

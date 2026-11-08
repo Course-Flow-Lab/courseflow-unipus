@@ -33,6 +33,7 @@ var DB_COURSE_ID = (() => {
   const match = CLASS_URL.match(/[?&]courseId=(\d+)/);
   return match ? match[1] : "";
 })();
+var BROWSER_STUDY = SETTINGS.browser_study !== false;
 var LOGIN_AES_KEY = Buffer.from("8AD70B641C024C7ADA2ECD082EC0334F", "hex");
 var LOGIN_AES_IV = Buffer.from("0102030405060708090A0B0C0D0E0F10", "hex");
 var CONTENT_KEY_PREFIX = "1a2b3c4d";
@@ -701,6 +702,353 @@ async function solveTextQuestions(session, group) {
   }
   return out;
 }
+function scriptAnswers(decoded) {
+  const out = [];
+  if (!decoded || typeof decoded !== "object") return out;
+  for (const group of Object.values(decoded)) {
+    for (const content of group?.content ?? []) {
+      const script = content?.audio?.script;
+      const html = typeof script === "string" ? script : script?.html;
+      if (!html) continue;
+      const matches = String(html).matchAll(/<span[^>]*text-decoration:\s*underline[^>]*>([\s\S]*?)<\/span>/g);
+      for (const match of matches) {
+        const text = stripHtml(match[1]);
+        if (text) out.push(text);
+      }
+    }
+  }
+  return out;
+}
+function browserStudyTask(mode, values) {
+  return (async () => {
+    const doc = document;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const visible = (node) => Boolean(node && node.offsetParent !== null);
+    const clickText = (text) => {
+      const node = Array.from(doc.querySelectorAll("*")).find(
+        (n) => n.children.length === 0 && (n.textContent || "").trim() === text && visible(n)
+      );
+      if (!node) return false;
+      node.click();
+      return true;
+    };
+    const dismissOverlays = async () => {
+      doc.querySelectorAll('.bfg-mask, .layui-layer, [class*="tooltip"]').forEach((el) => el.remove());
+      clickText("\u6211\u77E5\u9053\u4E86");
+      await sleep(200);
+      clickText("\u786E\u5B9A");
+      await sleep(400);
+    };
+    const waitFor = async (selector, timeoutMs = 15e3) => {
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        const nodes = Array.from(doc.querySelectorAll(selector));
+        if (nodes.length) return nodes;
+        clickText("\u6211\u77E5\u9053\u4E86");
+        clickText("\u786E\u5B9A");
+        await sleep(300);
+      }
+      return [];
+    };
+    const submitAndConfirm = async () => {
+      await dismissOverlays();
+      const barButtons = Array.from(doc.querySelectorAll('button[class*="submit-bar-pc--btn"]'));
+      const submit = barButtons[barButtons.length - 1] ?? Array.from(doc.querySelectorAll("button")).find((b) => (b.textContent || "").trim() === "\u63D0\u4EA4");
+      submit?.click();
+      const started = Date.now();
+      let confirmed = false;
+      while (Date.now() - started < 8e3) {
+        await sleep(400);
+        if (clickText("\u786E\u8BA4")) {
+          confirmed = true;
+          break;
+        }
+      }
+      await sleep(1e3);
+      const tail = String(doc.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+      return { submitted: Boolean(submit), confirmed, message: confirmed ? "" : tail.slice(-180) };
+    };
+    await dismissOverlays();
+    if (mode === "choice") {
+      const radios = await waitFor('input[type="radio"]');
+      const groups = [];
+      const byName = /* @__PURE__ */ new Map();
+      for (const radio of radios) {
+        const name = String(radio.name || "");
+        if (!name) continue;
+        if (!byName.has(name)) {
+          const group = [];
+          byName.set(name, group);
+          groups.push(group);
+        }
+        byName.get(name)?.push(radio);
+      }
+      const picked = [];
+      values.slice(0, groups.length).forEach((caption, index) => {
+        const group = groups[index];
+        const target = group.find((radio) => String(radio.value).toUpperCase() === caption.toUpperCase());
+        if (!target) return;
+        const label = target.closest("label") ?? target;
+        label.click();
+        picked.push(String(target.value));
+      });
+      if (groups.length === 0 || picked.length === 0) {
+        return { mode, groups: groups.length, picked, submitted: false, confirmed: false, error: "no_choices" };
+      }
+      await sleep(800);
+      const result2 = await submitAndConfirm();
+      return { mode, groups: groups.length, picked, ...result2 };
+    }
+    const inputs = await waitFor('input[type="text"]');
+    if (inputs.length === 0) {
+      return { mode, inputs: 0, filled: 0, submitted: false, confirmed: false, error: "no_inputs" };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    inputs.slice(0, values.length).forEach((input, index) => {
+      if (descriptor?.set) descriptor.set.call(input, values[index]);
+      else input.value = values[index];
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new Event("blur", { bubbles: true }));
+    });
+    await sleep(800);
+    const result = await submitAndConfirm();
+    return { mode, inputs: inputs.length, filled: inputs.filter((i) => i.value).length, ...result };
+  })();
+}
+function coursewareUrl(courseId, groupId, questionsList) {
+  const parentPath = questionsList?.[0]?.path?.[1] ?? [];
+  const coursewarePath = [...parentPath, groupId];
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}#/${courseId}/courseware/${coursewarePath.join("/")}/p_1`;
+}
+async function browserStudy(session, courseId, groupId, url, mode, values, auth, minScorePct) {
+  const opened = await hostCall("cw.browser.open", { session, url, purpose: "study" });
+  const page = opened?.page;
+  if (!page) return { status: "needs_human", reason: "\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4" };
+  let result = null;
+  try {
+    const expression = `(${browserStudyTask.toString()})(${JSON.stringify(mode)}, ${JSON.stringify(values)})`;
+    result = await hostCall("cw.browser.evaluate", {
+      session,
+      page,
+      stage: "save_study",
+      expression
+    });
+    log("info", `browser ${mode} ${groupId}: ${JSON.stringify(result).slice(0, 200)}`);
+    await new Promise((resolve) => setTimeout(resolve, 4e3));
+  } finally {
+    await hostCall("cw.browser.close", { session, page }).catch(() => {
+    });
+  }
+  const state = await groupState(session, courseId, groupId, auth);
+  const pass = Number(state?.data?.state?.state ?? 0);
+  const score = state?.data?.state?.score_avg ?? null;
+  if (pass === 1 && (minScorePct === 0 || Number(score ?? 0) >= minScorePct * 100)) {
+    return {
+      status: "completed",
+      evidence: { platform_confirmed: true, score, browser: true, browser_result: result },
+      checkpoint: { phase: "done" }
+    };
+  }
+  const detail = String(result?.message ?? "").trim();
+  return {
+    status: "needs_human",
+    reason: `\u6D4F\u89C8\u5668\u63D0\u4EA4\u540E\u5E73\u53F0\u672A\u786E\u8BA4\uFF08state ${pass}, score ${score ?? "?"}\uFF09${detail ? `\uFF1A${detail}` : ""}`,
+    evidence: { browser_result: result, state: pass, score }
+  };
+}
+async function studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
+  let answers = scriptAnswers(decoded);
+  if (answers.length === 0) {
+    const solved = await solveTextQuestions(session, questionGroup);
+    if (solved) {
+      answers = (questionGroup.questions ?? []).map(
+        (_, index) => solved[String(index)]?.[0] ?? ""
+      );
+    }
+  }
+  if (answers.length === 0) {
+    return { status: "needs_human", reason: "\u586B\u7A7A\u9898\u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
+  }
+  return browserStudy(
+    session,
+    courseId,
+    groupId,
+    coursewareUrl(courseId, groupId, questionsList),
+    "fill",
+    answers,
+    auth,
+    minScorePct
+  );
+}
+function matchChoiceCaption(options, texts) {
+  const normalized = texts.map((value) => String(value).trim()).filter(Boolean);
+  for (const value of normalized) {
+    const exactCaption = options.find(
+      (option) => String(option?.caption ?? "").trim().toLowerCase() === value.toLowerCase()
+    );
+    if (exactCaption) return String(exactCaption.caption);
+  }
+  for (const value of normalized) {
+    const exactText = options.find(
+      (option) => stripHtml(option?.content?.html).toLowerCase() === value.toLowerCase()
+    );
+    if (exactText) return String(exactText.caption);
+  }
+  for (const value of normalized) {
+    if (value.length < 4) continue;
+    const partial = options.find((option) => {
+      const text = stripHtml(option?.content?.html).toLowerCase();
+      return text.includes(value.toLowerCase()) || value.toLowerCase().includes(text);
+    });
+    if (partial) return String(partial.caption);
+  }
+  return String(options[0]?.caption ?? "A");
+}
+function choiceCaptions(group, solved) {
+  const questions = group?.questions ?? [];
+  return questions.map((question, index) => {
+    const options = question.options ?? [];
+    return matchChoiceCaption(options, solved[String(index)] ?? []);
+  });
+}
+async function studyChoiceBrowser(session, courseId, groupId, decoded, questionsList, auth, minScorePct) {
+  const choice = findChoiceGroup(decoded);
+  if (!choice) return { status: "needs_human", reason: "\u6CA1\u6709\u627E\u5230\u9009\u62E9\u9898\u7EC4" };
+  const solved = await solveChoiceQuestions(session, choice.group);
+  if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
+  const captions = choiceCaptions(choice.group, solved);
+  return browserStudy(
+    session,
+    courseId,
+    groupId,
+    coursewareUrl(courseId, groupId, questionsList),
+    "choice",
+    captions,
+    auth,
+    minScorePct
+  );
+}
+async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct) {
+  const category = String(questionGroup.category ?? "").toLowerCase();
+  const isFill = /fillblank/.test(category);
+  const choice = isFill ? null : findChoiceGroup(decoded);
+  let values = [];
+  if (isFill) {
+    values = scriptAnswers(decoded);
+    if (values.length === 0) {
+      const solved = await solveTextQuestions(session, questionGroup);
+      if (!solved) return { status: "needs_human", reason: "fillblankScoop \u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
+      values = (questionGroup.questions ?? []).map((_, index) => solved[String(index)]?.[0] ?? "");
+    }
+  } else if (choice) {
+    const solved = await solveChoiceQuestions(session, choice.group);
+    if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
+    values = choiceCaptions(choice.group, solved);
+  } else {
+    return { status: "needs_human", reason: `\u672A\u652F\u6301\u7684\u5BA2\u89C2\u9898\u7C7B\u578B ${category || "unknown"}` };
+  }
+  const questions = questionGroup.questions ?? [];
+  if (values.length === 0) return { status: "needs_human", reason: "\u6CA1\u6709\u6784\u9020\u51FA\u7B54\u6848" };
+  const userState = await fetchUserState(session, courseId, groupId, auth);
+  const version = String(
+    userState?.state?.version ?? userState?.version ?? Math.floor(Date.now() / 1e3)
+  );
+  const firstQid = collectQids(indexMap)[0];
+  if (!firstQid) return { status: "needs_human", reason: "\u9898\u7EC4\u6CA1\u6709\u8FD4\u56DE qid" };
+  const pages = {};
+  const answerList = {};
+  const answers = {};
+  for (let index = 0; index < questions.length; index += 1) {
+    const path = questionsList[index]?.path?.[0] ?? [];
+    const pageId = String(path[1] ?? "p_1");
+    const meta = pageMeta(indexMap, pageId);
+    const qid = meta.qid ?? firstQid;
+    const rule = String(
+      (Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules) ?? (isFill ? "in" : "eq")
+    );
+    const value = values[index] ?? "";
+    answerList[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: "v2",
+      rule
+    };
+    answers[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: "v2",
+      rule,
+      user_answer: {
+        qid,
+        rule,
+        answer: { index, answer: value, version: "v2" },
+        content: "",
+        id: `${qid}-${index}`,
+        offset: 0
+      }
+    };
+    const existingComponent = userState?.state?.[pageId] ? Object.keys(userState.state[pageId])[0] : "";
+    const component = existingComponent || "c_1_1";
+    pages[pageId] ??= { [component]: { student_answers: {} } };
+    pages[pageId][component].student_answers[String(index)] = value;
+  }
+  const stateObj = {
+    version,
+    ...pages,
+    __EXTEND_DATA__: { __SUMMARY__: { answerList } }
+  };
+  const payload = {
+    enable_mistake: false,
+    version: "default",
+    record_version: version,
+    state: JSON.stringify(stateObj),
+    specific_scores: questions.map(() => null),
+    answers
+  };
+  const submit = await hostFetchFor(session, "save_study")(
+    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
+    {
+      method: "POST",
+      headers: {
+        ...BROWSER_HEADERS,
+        ...annotatorHeaders(auth),
+        "content-type": "application/json",
+        origin: UCONTENT_BASE,
+        referer: `${UCONTENT_BASE}/_pc_default/pc.html`
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+  let submitJson = null;
+  try {
+    submitJson = JSON.parse(submit.body);
+  } catch {
+  }
+  log("info", `submit ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? "?"}`);
+  if (submitJson?.code !== 0) {
+    return {
+      status: "needs_human",
+      reason: `\u9898\u7EC4\u63D0\u4EA4\u5931\u8D25\uFF1Acode ${submitJson?.code ?? "?"} ${submitJson?.msg ?? submit.body.slice(0, 160)}`
+    };
+  }
+  const info = submitJson?.data?.submit_info;
+  const submitState = Number(info?.state?.state ?? 0);
+  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
+  const score = info?.state?.score ?? null;
+  if (submitState === 1 && (minScorePct === 0 || scorePct >= minScorePct)) {
+    return {
+      status: "completed",
+      evidence: { platform_confirmed: true, score, score_pct: scorePct, min_score_pct: minScorePct, api: true },
+      checkpoint: { phase: "done" }
+    };
+  }
+  return {
+    status: "needs_human",
+    reason: `\u9898\u7EC4\u5DF2\u63D0\u4EA4\u4F46\u672A\u8FBE\u5230\u901A\u8FC7\u6761\u4EF6\uFF08score_pct ${scorePct}, min ${minScorePct}\uFF09`,
+    evidence: { score, score_pct: scorePct, min_score_pct: minScorePct }
+  };
+}
 async function studyTask(session, courseId, unit, auth) {
   const groupId = String(unit.id ?? "").split("::")[0];
   let minScorePct = 0;
@@ -716,7 +1064,25 @@ async function studyTask(session, courseId, unit, auth) {
   } catch {
     minScorePct = 0;
   }
-  if (minScorePct > 0 && SETTINGS.enable_task_submit !== true) {
+  const now = Math.floor(Date.now() / 1e3);
+  const startTime = Number(progressData?.flowStrategy?.startTime ?? 0);
+  const endTime = Number(progressData?.flowStrategy?.endTime ?? 0);
+  if (startTime > 0 && now < startTime) {
+    return {
+      status: "blocked",
+      reason: "\u5B66\u4E60\u5F00\u59CB\u65F6\u95F4\u672A\u5230\uFF0C\u5E73\u53F0\u4E0D\u5141\u8BB8\u63D0\u4EA4",
+      wait_ms: Math.min((startTime - now) * 1e3, 36e5),
+      evidence: { start_time: startTime, now }
+    };
+  }
+  if (endTime > 0 && now > endTime) {
+    return {
+      status: "blocked",
+      reason: "\u5B66\u4E60\u622A\u6B62\u65F6\u95F4\u5DF2\u8FC7\uFF0C\u5E73\u53F0\u4E0D\u5141\u8BB8\u63D0\u4EA4",
+      evidence: { end_time: endTime, now }
+    };
+  }
+  if (minScorePct > 0 && SETTINGS.enable_task_submit !== true && !BROWSER_STUDY) {
     return {
       status: "needs_human",
       reason: `\u9898\u7EC4\u6709\u8BA1\u5206\u8981\u6C42\uFF08min_score_pct=${minScorePct}\uFF09\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED`
@@ -754,6 +1120,26 @@ async function studyTask(session, courseId, unit, auth) {
     return { status: "needs_human", reason: "\u9898\u7EC4\u5185\u5BB9\u91CC\u6CA1\u6709\u9898\u76EE" };
   }
   const category = String(questionGroup.category ?? "").toLowerCase();
+  const isFill = /fillblank/.test(category);
+  const isChoice = category === "singlechoice" || category === "truefalse" || category === "true_false" || category === "choice";
+  if (isFill) {
+    if (BROWSER_STUDY) {
+      return studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct);
+    }
+    if (SETTINGS.enable_task_submit !== true) {
+      return { status: "needs_human", reason: "\u586B\u7A7A\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
+    }
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+  }
+  if (isChoice) {
+    if (BROWSER_STUDY) {
+      return studyChoiceBrowser(session, courseId, groupId, decoded, questionsList, auth, minScorePct);
+    }
+    if (SETTINGS.enable_task_submit !== true) {
+      return { status: "needs_human", reason: "\u9009\u62E9\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
+    }
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+  }
   const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
   if (objective && SETTINGS.enable_task_submit !== true) {
     return {
@@ -779,14 +1165,7 @@ async function studyTask(session, courseId, unit, auth) {
     const texts = solved[String(index)] ?? [];
     let answerValue;
     if (choice) {
-      const options = question.options ?? [];
-      let optionIndex = options.findIndex((option) => {
-        const caption = String(option?.caption ?? "");
-        const text = stripHtml(option?.content?.html);
-        return texts.some((value) => value === caption || value === text || text.includes(value) || value.includes(text));
-      });
-      if (optionIndex < 0) optionIndex = 0;
-      answerValue = String(options[optionIndex]?.caption ?? "A");
+      answerValue = matchChoiceCaption(question.options ?? [], texts);
     } else {
       answerValue = texts[0] ?? "Answered.";
     }

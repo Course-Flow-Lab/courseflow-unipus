@@ -43,6 +43,7 @@ const DB_COURSE_ID = (() => {
   const match = CLASS_URL.match(/[?&]courseId=(\d+)/);
   return match ? match[1] : '';
 })();
+const BROWSER_STUDY = SETTINGS.browser_study !== false;
 
 const LOGIN_AES_KEY = Buffer.from('8AD70B641C024C7ADA2ECD082EC0334F', 'hex');
 const LOGIN_AES_IV = Buffer.from('0102030405060708090A0B0C0D0E0F10', 'hex');
@@ -833,6 +834,406 @@ async function solveTextQuestions(session: string, group: any): Promise<Record<s
   return out;
 }
 
+function scriptAnswers(decoded: any): string[] {
+  const out: string[] = [];
+  if (!decoded || typeof decoded !== 'object') return out;
+  for (const group of Object.values(decoded) as any[]) {
+    for (const content of group?.content ?? []) {
+      const script = content?.audio?.script;
+      const html = typeof script === 'string' ? script : script?.html;
+      if (!html) continue;
+      const matches = String(html).matchAll(/<span[^>]*text-decoration:\s*underline[^>]*>([\s\S]*?)<\/span>/g);
+      for (const match of matches) {
+        const text = stripHtml(match[1]);
+        if (text) out.push(text);
+      }
+    }
+  }
+  return out;
+}
+
+function browserStudyTask(mode: string, values: string[]) {
+  return (async () => {
+    const doc: any = document;
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const visible = (node: any) => Boolean(node && node.offsetParent !== null);
+    const clickText = (text: string) => {
+      const node = (Array.from(doc.querySelectorAll('*')) as any[]).find(
+        (n: any) => n.children.length === 0 && (n.textContent || '').trim() === text && visible(n),
+      );
+      if (!node) return false;
+      node.click();
+      return true;
+    };
+    const dismissOverlays = async () => {
+      doc.querySelectorAll('.bfg-mask, .layui-layer, [class*="tooltip"]').forEach((el: any) => el.remove());
+      clickText('我知道了');
+      await sleep(200);
+      clickText('确定');
+      await sleep(400);
+    };
+    const waitFor = async (selector: string, timeoutMs = 15000) => {
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        const nodes = Array.from(doc.querySelectorAll(selector)) as any[];
+        if (nodes.length) return nodes;
+        clickText('我知道了');
+        clickText('确定');
+        await sleep(300);
+      }
+      return [] as any[];
+    };
+    const submitAndConfirm = async () => {
+      await dismissOverlays();
+      const barButtons = Array.from(doc.querySelectorAll('button[class*="submit-bar-pc--btn"]')) as any[];
+      const submit =
+        barButtons[barButtons.length - 1] ??
+        (Array.from(doc.querySelectorAll('button')) as any[]).find((b: any) => (b.textContent || '').trim() === '提交');
+      submit?.click();
+      const started = Date.now();
+      let confirmed = false;
+      while (Date.now() - started < 8000) {
+        await sleep(400);
+        if (clickText('确认')) {
+          confirmed = true;
+          break;
+        }
+      }
+      await sleep(1000);
+      const tail = String(doc.body?.innerText ?? '').replace(/\s+/g, ' ').trim();
+      return { submitted: Boolean(submit), confirmed, message: confirmed ? '' : tail.slice(-180) };
+    };
+
+    await dismissOverlays();
+    if (mode === 'choice') {
+      const radios = (await waitFor('input[type="radio"]')) as any[];
+      const groups: any[][] = [];
+      const byName = new Map<string, any[]>();
+      for (const radio of radios) {
+        const name = String(radio.name || '');
+        if (!name) continue;
+        if (!byName.has(name)) {
+          const group: any[] = [];
+          byName.set(name, group);
+          groups.push(group);
+        }
+        byName.get(name)?.push(radio);
+      }
+      const picked: string[] = [];
+      values.slice(0, groups.length).forEach((caption: string, index: number) => {
+        const group = groups[index];
+        const target = group.find((radio: any) => String(radio.value).toUpperCase() === caption.toUpperCase());
+        if (!target) return;
+        const label = target.closest('label') ?? target;
+        label.click();
+        picked.push(String(target.value));
+      });
+      if (groups.length === 0 || picked.length === 0) {
+        return { mode, groups: groups.length, picked, submitted: false, confirmed: false, error: 'no_choices' };
+      }
+      await sleep(800);
+      const result = await submitAndConfirm();
+      return { mode, groups: groups.length, picked, ...result };
+    }
+
+    const inputs = (await waitFor('input[type="text"]')) as any[];
+    if (inputs.length === 0) {
+      return { mode, inputs: 0, filled: 0, submitted: false, confirmed: false, error: 'no_inputs' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    inputs.slice(0, values.length).forEach((input: any, index: number) => {
+      if (descriptor?.set) descriptor.set.call(input, values[index]);
+      else input.value = values[index];
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('blur', { bubbles: true }));
+    });
+    await sleep(800);
+    const result = await submitAndConfirm();
+    return { mode, inputs: inputs.length, filled: inputs.filter((i: any) => i.value).length, ...result };
+  })();
+}
+
+function coursewareUrl(courseId: string, groupId: string, questionsList: any[]) {
+  const parentPath = questionsList?.[0]?.path?.[1] ?? [];
+  const coursewarePath = [...parentPath, groupId];
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}#/${courseId}/courseware/${coursewarePath.join('/')}/p_1`;
+}
+
+async function browserStudy(
+  session: string,
+  courseId: string,
+  groupId: string,
+  url: string,
+  mode: 'fill' | 'choice',
+  values: string[],
+  auth: any,
+  minScorePct: number,
+) {
+  const opened = await hostCall('cw.browser.open', { session, url, purpose: 'study' });
+  const page = opened?.page;
+  if (!page) return { status: 'needs_human', reason: '官方浏览器没有返回页面句柄' };
+  let result: any = null;
+  try {
+    const expression = `(${browserStudyTask.toString()})(${JSON.stringify(mode)}, ${JSON.stringify(values)})`;
+    result = await hostCall('cw.browser.evaluate', {
+      session,
+      page,
+      stage: 'save_study',
+      expression,
+    });
+    log('info', `browser ${mode} ${groupId}: ${JSON.stringify(result).slice(0, 200)}`);
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+  } finally {
+    await hostCall('cw.browser.close', { session, page }).catch(() => {});
+  }
+  const state = await groupState(session, courseId, groupId, auth);
+  const pass = Number(state?.data?.state?.state ?? 0);
+  const score = state?.data?.state?.score_avg ?? null;
+  if (pass === 1 && (minScorePct === 0 || Number(score ?? 0) >= minScorePct * 100)) {
+    return {
+      status: 'completed',
+      evidence: { platform_confirmed: true, score, browser: true, browser_result: result },
+      checkpoint: { phase: 'done' },
+    };
+  }
+  const detail = String(result?.message ?? '').trim();
+  return {
+    status: 'needs_human',
+    reason: `浏览器提交后平台未确认（state ${pass}, score ${score ?? '?'}）${detail ? `：${detail}` : ''}`,
+    evidence: { browser_result: result, state: pass, score },
+  };
+}
+
+async function studyFillblankBrowser(
+  session: string,
+  courseId: string,
+  groupId: string,
+  decoded: any,
+  questionGroup: any,
+  questionsList: any[],
+  auth: any,
+  minScorePct: number,
+) {
+  let answers = scriptAnswers(decoded);
+  if (answers.length === 0) {
+    const solved = await solveTextQuestions(session, questionGroup);
+    if (solved) {
+      answers = (questionGroup.questions ?? []).map(
+        (_: any, index: number) => solved[String(index)]?.[0] ?? '',
+      );
+    }
+  }
+  if (answers.length === 0) {
+    return { status: 'needs_human', reason: '填空题没有答案来源' };
+  }
+  return browserStudy(
+    session,
+    courseId,
+    groupId,
+    coursewareUrl(courseId, groupId, questionsList),
+    'fill',
+    answers,
+    auth,
+    minScorePct,
+  );
+}
+
+function matchChoiceCaption(options: any[], texts: string[]): string {
+  const normalized = texts.map((value) => String(value).trim()).filter(Boolean);
+  for (const value of normalized) {
+    const exactCaption = options.find(
+      (option: any) => String(option?.caption ?? '').trim().toLowerCase() === value.toLowerCase(),
+    );
+    if (exactCaption) return String(exactCaption.caption);
+  }
+  for (const value of normalized) {
+    const exactText = options.find(
+      (option: any) => stripHtml(option?.content?.html).toLowerCase() === value.toLowerCase(),
+    );
+    if (exactText) return String(exactText.caption);
+  }
+  for (const value of normalized) {
+    if (value.length < 4) continue;
+    const partial = options.find((option: any) => {
+      const text = stripHtml(option?.content?.html).toLowerCase();
+      return text.includes(value.toLowerCase()) || value.toLowerCase().includes(text);
+    });
+    if (partial) return String(partial.caption);
+  }
+  return String(options[0]?.caption ?? 'A');
+}
+
+function choiceCaptions(group: any, solved: Record<string, string[]>): string[] {
+  const questions = group?.questions ?? [];
+  return questions.map((question: any, index: number) => {
+    const options = question.options ?? [];
+    return matchChoiceCaption(options, solved[String(index)] ?? []);
+  });
+}
+
+async function studyChoiceBrowser(
+  session: string,
+  courseId: string,
+  groupId: string,
+  decoded: any,
+  questionsList: any[],
+  auth: any,
+  minScorePct: number,
+) {
+  const choice = findChoiceGroup(decoded);
+  if (!choice) return { status: 'needs_human', reason: '没有找到选择题组' };
+  const solved = await solveChoiceQuestions(session, choice.group);
+  if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
+  const captions = choiceCaptions(choice.group, solved);
+  return browserStudy(
+    session,
+    courseId,
+    groupId,
+    coursewareUrl(courseId, groupId, questionsList),
+    'choice',
+    captions,
+    auth,
+    minScorePct,
+  );
+}
+
+async function studyObjectiveApi(
+  session: string,
+  courseId: string,
+  groupId: string,
+  decoded: any,
+  questionGroup: any,
+  questionsList: any[],
+  indexMap: any,
+  auth: any,
+  minScorePct: number,
+) {
+  const category = String(questionGroup.category ?? '').toLowerCase();
+  const isFill = /fillblank/.test(category);
+  const choice = isFill ? null : findChoiceGroup(decoded);
+  let values: string[] = [];
+  if (isFill) {
+    values = scriptAnswers(decoded);
+    if (values.length === 0) {
+      const solved = await solveTextQuestions(session, questionGroup);
+      if (!solved) return { status: 'needs_human', reason: 'fillblankScoop 没有答案来源' };
+      values = (questionGroup.questions ?? []).map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
+    }
+  } else if (choice) {
+    const solved = await solveChoiceQuestions(session, choice.group);
+    if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
+    values = choiceCaptions(choice.group, solved);
+  } else {
+    return { status: 'needs_human', reason: `未支持的客观题类型 ${category || 'unknown'}` };
+  }
+
+  const questions = questionGroup.questions ?? [];
+  if (values.length === 0) return { status: 'needs_human', reason: '没有构造出答案' };
+  const userState = await fetchUserState(session, courseId, groupId, auth);
+  const version = String(
+    userState?.state?.version ?? userState?.version ?? Math.floor(Date.now() / 1000),
+  );
+  const firstQid = collectQids(indexMap)[0];
+  if (!firstQid) return { status: 'needs_human', reason: '题组没有返回 qid' };
+
+  const pages: Record<string, any> = {};
+  const answerList: Record<string, any> = {};
+  const answers: Record<string, any> = {};
+  for (let index = 0; index < questions.length; index += 1) {
+    const path = questionsList[index]?.path?.[0] ?? [];
+    const pageId = String(path[1] ?? 'p_1');
+    const meta = pageMeta(indexMap, pageId);
+    const qid = meta.qid ?? firstQid;
+    const rule = String(
+      (Array.isArray(meta.rules) ? meta.rules[index] ?? meta.rules[0] : meta.rules) ??
+        (isFill ? 'in' : 'eq'),
+    );
+    const value = values[index] ?? '';
+    answerList[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: 'v2',
+      rule,
+    };
+    answers[String(index)] = {
+      student_answer: value,
+      isDone: true,
+      version: 'v2',
+      rule,
+      user_answer: {
+        qid,
+        rule,
+        answer: { index, answer: value, version: 'v2' },
+        content: '',
+        id: `${qid}-${index}`,
+        offset: 0,
+      },
+    };
+    const existingComponent = userState?.state?.[pageId]
+      ? Object.keys(userState.state[pageId])[0]
+      : '';
+    const component = existingComponent || 'c_1_1';
+    pages[pageId] ??= { [component]: { student_answers: {} } };
+    pages[pageId][component].student_answers[String(index)] = value;
+  }
+
+  const stateObj = {
+    version,
+    ...pages,
+    __EXTEND_DATA__: { __SUMMARY__: { answerList } },
+  };
+  const payload = {
+    enable_mistake: false,
+    version: 'default',
+    record_version: version,
+    state: JSON.stringify(stateObj),
+    specific_scores: questions.map(() => null),
+    answers,
+  };
+  const submit = await hostFetchFor(session, 'save_study')(
+    `${UCONTENT_BASE}/course/api/v3/submit/${courseId}/${groupId}/`,
+    {
+      method: 'POST',
+      headers: {
+        ...BROWSER_HEADERS,
+        ...annotatorHeaders(auth),
+        'content-type': 'application/json',
+        origin: UCONTENT_BASE,
+        referer: `${UCONTENT_BASE}/_pc_default/pc.html`,
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+  let submitJson: any = null;
+  try {
+    submitJson = JSON.parse(submit.body);
+  } catch {}
+  log('info', `submit ${groupId} HTTP ${submit.status} code ${submitJson?.code ?? '?'}`);
+  if (submitJson?.code !== 0) {
+    return {
+      status: 'needs_human',
+      reason: `题组提交失败：code ${submitJson?.code ?? '?'} ${submitJson?.msg ?? submit.body.slice(0, 160)}`,
+    };
+  }
+  const info = submitJson?.data?.submit_info;
+  const submitState = Number(info?.state?.state ?? 0);
+  const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
+  const score = info?.state?.score ?? null;
+  if (submitState === 1 && (minScorePct === 0 || scorePct >= minScorePct)) {
+    return {
+      status: 'completed',
+      evidence: { platform_confirmed: true, score, score_pct: scorePct, min_score_pct: minScorePct, api: true },
+      checkpoint: { phase: 'done' },
+    };
+  }
+  return {
+    status: 'needs_human',
+    reason: `题组已提交但未达到通过条件（score_pct ${scorePct}, min ${minScorePct}）`,
+    evidence: { score, score_pct: scorePct, min_score_pct: minScorePct },
+  };
+}
+
 async function studyTask(session: string, courseId: string, unit: any, auth: any) {
   const groupId = String(unit.id ?? '').split('::')[0];
   let minScorePct = 0;
@@ -848,7 +1249,25 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
   } catch {
     minScorePct = 0;
   }
-  if (minScorePct > 0 && SETTINGS.enable_task_submit !== true) {
+  const now = Math.floor(Date.now() / 1000);
+  const startTime = Number(progressData?.flowStrategy?.startTime ?? 0);
+  const endTime = Number(progressData?.flowStrategy?.endTime ?? 0);
+  if (startTime > 0 && now < startTime) {
+    return {
+      status: 'blocked',
+      reason: '学习开始时间未到，平台不允许提交',
+      wait_ms: Math.min((startTime - now) * 1000, 3600000),
+      evidence: { start_time: startTime, now },
+    };
+  }
+  if (endTime > 0 && now > endTime) {
+    return {
+      status: 'blocked',
+      reason: '学习截止时间已过，平台不允许提交',
+      evidence: { end_time: endTime, now },
+    };
+  }
+  if (minScorePct > 0 && SETTINGS.enable_task_submit !== true && !BROWSER_STUDY) {
     return {
       status: 'needs_human',
       reason: `题组有计分要求（min_score_pct=${minScorePct}），自动提交默认关闭`,
@@ -885,6 +1304,27 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     return { status: 'needs_human', reason: '题组内容里没有题目' };
   }
   const category = String(questionGroup.category ?? '').toLowerCase();
+  const isFill = /fillblank/.test(category);
+  const isChoice = category === 'singlechoice' || category === 'truefalse' || category === 'true_false' || category === 'choice';
+  if (isFill) {
+    if (BROWSER_STUDY) {
+      return studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct);
+    }
+    if (SETTINGS.enable_task_submit !== true) {
+      return { status: 'needs_human', reason: '填空题会计分，API 自动提交默认关闭' };
+    }
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+  }
+  if (isChoice) {
+    if (BROWSER_STUDY) {
+      return studyChoiceBrowser(session, courseId, groupId, decoded, questionsList, auth, minScorePct);
+    }
+    if (SETTINGS.enable_task_submit !== true) {
+      return { status: 'needs_human', reason: '选择题会计分，API 自动提交默认关闭' };
+    }
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+  }
+
   const objective = /single|truefalse|true_false|fillblank|sequence|matching|choice/.test(category);
   if (objective && SETTINGS.enable_task_submit !== true) {
     return {
@@ -913,14 +1353,7 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     const texts = solved[String(index)] ?? [];
     let answerValue: any;
     if (choice) {
-      const options = question.options ?? [];
-      let optionIndex = options.findIndex((option: any) => {
-        const caption = String(option?.caption ?? '');
-        const text = stripHtml(option?.content?.html);
-        return texts.some((value) => value === caption || value === text || text.includes(value) || value.includes(text));
-      });
-      if (optionIndex < 0) optionIndex = 0;
-      answerValue = String(options[optionIndex]?.caption ?? 'A');
+      answerValue = matchChoiceCaption(question.options ?? [], texts);
     } else {
       answerValue = texts[0] ?? 'Answered.';
     }
