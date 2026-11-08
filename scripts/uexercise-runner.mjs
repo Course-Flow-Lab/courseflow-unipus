@@ -15,7 +15,11 @@
  *     --answers answers.json --submit
  */
 import { chromium } from 'playwright';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 function parseArgs(argv) {
   const out = { submit: false, headed: false, channel: 'msedge' };
@@ -23,7 +27,7 @@ function parseArgs(argv) {
     const key = argv[i];
     if (!key.startsWith('--')) continue;
     const name = key.slice(2);
-    if (['submit', 'headed', 'help', 'dump'].includes(name)) {
+    if (['submit', 'headed', 'help', 'dump', 'generate', 'heuristic'].includes(name)) {
       out[name] = true;
       continue;
     }
@@ -44,6 +48,15 @@ function usage() {
   --password <password>     U校园密码（也可用 UNIPUS_PASSWORD）
   --save-state <file>       登录后保存 storageState
   --answers <file>          答案 JSON：{ "1": "A" } 或 { "1": "选项原文" }
+  --generate                下载音频、ASR、AI 生成答案
+  --answers-out <file>      生成答案输出，默认 uexercise-answers.json
+  --transcripts-out <file>  保存 ASR 转写 JSON
+  --asr-model <name>        faster-whisper 模型，默认 base.en
+  --asr-python <path>       默认 python
+  --ai-base <url>           OpenAI 兼容地址，如 https://api.siliconflow.cn/v1
+  --ai-key <key>            AI Key；也可用 UEX_AI_KEY
+  --ai-model <name>         AI 模型名
+  --heuristic               不调用 AI，使用关键词匹配兜底
   --dump                    只解析题目，输出 JSON
   --out <file>              dump 输出文件，默认 stdout
   --submit                  真正交卷；不加时只填答案/演练
@@ -164,6 +177,29 @@ async function readExam(page) {
     const audio = Array.from(document.querySelectorAll('.itest-hear-reslist span'))
       .map((node) => (node.textContent || '').trim())
       .filter(Boolean);
+    const sections = Array.from(document.querySelectorAll('.itest-section')).map((section) => {
+      const sectionAudio = Array.from(section.querySelectorAll('.itest-hear-reslist span'))
+        .map((node) => (node.textContent || '').trim())
+        .filter(Boolean);
+      const questionSets = Array.from(section.querySelectorAll('.itest-ques-set')).map((set) => {
+        const inputs = Array.from(set.querySelectorAll('input[type="radio"], input[type="text"], textarea'));
+        const indexes = [...new Set(inputs.map((input) => input.getAttribute('qIndex')).filter(Boolean))];
+        return {
+          qid: set.getAttribute('questionid') ?? '',
+          indexes,
+          audio: Array.from(set.querySelectorAll('.itest-hear-reslist span'))
+            .map((node) => (node.textContent || '').trim())
+            .filter(Boolean),
+        };
+      });
+      return {
+        sectionId: section.getAttribute('sectionId') ?? '',
+        sectionType: section.getAttribute('sectionType') ?? '',
+        title: (section.querySelector('.title')?.innerText ?? '').replace(/\s+/g, ' ').trim(),
+        audio: sectionAudio,
+        questions: questionSets,
+      };
+    });
     return {
       url: location.href,
       title: document.title,
@@ -173,6 +209,7 @@ async function readExam(page) {
       questionCount: questions.length,
       questions,
       audio,
+      sections,
       body: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1500),
     };
   });
@@ -229,6 +266,7 @@ async function fillAnswers(page, answers) {
 }
 
 async function submitExam(page) {
+  await dismissOverlays(page);
   const responsePromise = page.waitForResponse(
     (r) => /\/itest\/s\/clsanswer\/submitUT/.test(r.url()),
     { timeout: 30000 },
@@ -263,6 +301,214 @@ async function submitExam(page) {
   };
 }
 
+function parseAudioGroup(value) {
+  try {
+    const parsed = JSON.parse(String(value));
+    if (Array.isArray(parsed)) return parsed.filter((item) => typeof item === 'string' && /^https?:/.test(item));
+  } catch {}
+  return /^https?:/.test(String(value)) ? [String(value)] : [];
+}
+
+function collectAudioUrls(details) {
+  const urls = [];
+  for (const group of details.audio ?? []) urls.push(...parseAudioGroup(group));
+  for (const section of details.sections ?? []) {
+    for (const group of section.audio ?? []) urls.push(...parseAudioGroup(group));
+    for (const question of section.questions ?? []) {
+      for (const group of question.audio ?? []) urls.push(...parseAudioGroup(group));
+    }
+  }
+  return [...new Set(urls)];
+}
+
+async function downloadAudios(urls, directory) {
+  const manifest = [];
+  const byUrl = new Map();
+  for (const url of urls) {
+    if (byUrl.has(url)) continue;
+    const id = `a${byUrl.size + 1}`;
+    const path = join(directory, `${id}.mp3`);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      writeFileSync(path, Buffer.from(await response.arrayBuffer()));
+      byUrl.set(url, id);
+      manifest.push({ id, path, url });
+    } catch (error) {
+      console.error(`audio download failed ${url}: ${error.message}`);
+    }
+  }
+  return { manifest, byUrl };
+}
+
+async function transcribeAudios(manifest, args) {
+  if (manifest.length === 0) return {};
+  const script = fileURLToPath(new URL('./transcribe_many.py', import.meta.url));
+  const manifestPath = `${manifest[0].path}.manifest.json`;
+  const outputPath = `${manifest[0].path}.transcripts.json`;
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  const python = args['asr-python'] ?? 'python';
+  const model = args['asr-model'] ?? 'base.en';
+  await new Promise((resolve, reject) => {
+    const child = spawn(python, [script, manifestPath, outputPath, model], {
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+        HF_ENDPOINT: process.env.HF_ENDPOINT || process.env.CF_ASR_HF_ENDPOINT || 'https://hf-mirror.com',
+      },
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('ASR timeout'));
+    }, Number(args['asr-timeout'] ?? 300000));
+    child.once('error', (error) => { clearTimeout(timer); reject(error); });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`ASR exit ${code}`));
+    });
+  });
+  return JSON.parse(readFileSync(outputPath, 'utf8'));
+}
+
+function transcriptsByUrl(details, manifest, transcripts) {
+  const map = new Map();
+  for (const item of manifest) map.set(item.url, transcripts[item.id] ?? '');
+  return map;
+}
+
+function questionTranscripts(details, byUrl) {
+  const map = {};
+  const all = [...byUrl.values()].filter(Boolean).join(' ');
+  for (const section of details.sections ?? []) {
+    const sectionText = (section.audio ?? [])
+      .flatMap(parseAudioGroup)
+      .map((url) => byUrl.get(url) ?? '')
+      .filter(Boolean)
+      .join(' ');
+    for (const question of section.questions ?? []) {
+      const questionText = (question.audio ?? [])
+        .flatMap(parseAudioGroup)
+        .map((url) => byUrl.get(url) ?? '')
+        .filter(Boolean)
+        .join(' ');
+      const text = questionText || sectionText || all;
+      for (const index of question.indexes ?? []) map[index] = text;
+    }
+  }
+  return map;
+}
+
+function buildAiPrompt(details, byUrl) {
+  const transcripts = [...byUrl.entries()]
+    .filter(([, text]) => text)
+    .map(([url, text], index) => `[T${index + 1}] ${text}`)
+    .join('\n');
+  const questions = details.questions.map((question) => ({
+    index: question.index,
+    type: question.type,
+    options: question.options?.map((option) => option.text) ?? [],
+  }));
+  return [
+    '你是 U校园单元测试答题助手。',
+    '根据听力转写和题目，给出每道题的答案。',
+    '选择题返回页面显示的选项字母（A/B/C/D）；填空题返回要填入的文本。',
+    '只输出一个 JSON 对象，key 是题号，value 是答案字符串，例如 {"1":"D","16":"word"}。',
+    '题目：',
+    JSON.stringify(questions),
+    '听力转写：',
+    transcripts,
+  ].join('\n');
+}
+
+async function callAi(args, prompt) {
+  const base = args['ai-base'] ?? process.env.UEX_AI_BASE;
+  const key = args['ai-key'] ?? process.env.UEX_AI_KEY;
+  const model = args['ai-model'] ?? process.env.UEX_AI_MODEL;
+  if (!base || !key || !model) return null;
+  const endpoint = base.endsWith('/chat/completions') ? base : `${base.replace(/\/$/, '')}/chat/completions`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: '你是课程答题助手，只输出合法 JSON。' },
+        { role: 'user', content: prompt },
+      ],
+      stream: false,
+    }),
+    signal: AbortSignal.timeout(120000),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI HTTP ${response.status}: ${text.slice(0, 200)}`);
+  const data = JSON.parse(text);
+  const content = String(data.choices?.[0]?.message?.content ?? '').trim();
+  const start = content.indexOf('{');
+  const end = content.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('AI 没有返回 JSON');
+  const parsed = JSON.parse(content.slice(start, end + 1));
+  const out = {};
+  for (const [keyName, value] of Object.entries(parsed)) {
+    if (typeof value === 'string' || Array.isArray(value)) out[String(keyName)] = value;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function heuristicAnswers(details, byUrl) {
+  const byQuestion = questionTranscripts(details, byUrl);
+  const answers = {};
+  for (const question of details.questions) {
+    const transcript = String(byQuestion[question.index] ?? '').toLowerCase();
+    if (question.type === 'radio') {
+      let best = null;
+      let bestScore = -1;
+      for (const option of question.options ?? []) {
+        const text = option.text.replace(/^[A-Z][.、]\s*/i, '').toLowerCase();
+        const tokens = text.split(/[^a-z0-9']+/).filter((token) => token.length > 2);
+        const score = tokens.reduce((sum, token) => sum + (transcript.includes(token) ? 1 : 0), 0);
+        if (score > bestScore) { bestScore = score; best = option; }
+      }
+      const letter = String(best?.text ?? '').match(/^([A-Z])[.、]/i)?.[1] ?? 'A';
+      answers[question.index] = letter.toUpperCase();
+    } else {
+      answers[question.index] = '';
+    }
+  }
+  return answers;
+}
+
+async function generateAnswers(details, args) {
+  const urls = collectAudioUrls(details);
+  const directory = mkdtempSync(join(tmpdir(), 'uexercise-audio-'));
+  try {
+    const { manifest, byUrl } = await downloadAudios(urls, directory);
+    console.error(`audio: ${manifest.length} file(s)`);
+    const transcripts = await transcribeAudios(manifest, args);
+    if (args['transcripts-out']) writeFileSync(args['transcripts-out'], JSON.stringify(transcripts, null, 2));
+    const transcriptMap = transcriptsByUrl(details, manifest, transcripts);
+    let answers = null;
+    if (!args.heuristic) {
+      try {
+        answers = await callAi(args, buildAiPrompt(details, transcriptMap));
+      } catch (error) {
+        console.error(`AI failed: ${error.message}`);
+      }
+    }
+    if (!answers) {
+      console.error('using heuristic answer fallback');
+      answers = heuristicAnswers(details, transcriptMap);
+    }
+    const output = args['answers-out'] ?? 'uexercise-answers.json';
+    writeFileSync(output, JSON.stringify(answers, null, 2));
+    console.log(`answers written to ${output} (${Object.keys(answers).length})`);
+    return answers;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) { usage(); return; }
@@ -294,18 +540,24 @@ async function main() {
   await exam.goto(examUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await exam.waitForSelector('#submitAnswerForm, .itest-section', { timeout: 30000 });
   await exam.waitForTimeout(2000);
+  await dismissOverlays(exam);
+  await exam.waitForTimeout(800);
   const details = await readExam(exam);
-  if (args.dump || !args.answers) {
+  let answers = null;
+  if (args.generate) {
+    answers = await generateAnswers(details, args);
+  } else if (args.answers) {
+    answers = JSON.parse(readFileSync(args.answers, 'utf8'));
+  }
+  if (args.dump || !answers) {
     const text = JSON.stringify(details, null, 2);
     if (args.out) writeFileSync(args.out, text);
     else console.log(text);
-    if (!args.answers) {
+    if (!answers) {
       await browser.close();
       return;
     }
   }
-  if (!args.answers) { await browser.close(); return; }
-  const answers = JSON.parse(readFileSync(args.answers, 'utf8'));
   const filled = await fillAnswers(exam, answers);
   console.log(`filled radio=${filled.radio} text=${filled.text} missing=${JSON.stringify(filled.missing)}`);
   if (!args.submit) {

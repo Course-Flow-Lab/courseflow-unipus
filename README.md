@@ -267,7 +267,30 @@ node scripts/uexercise-runner.mjs \
 - 音频 URL 列表
 - `sppid`、`exerciseId`、表单 action
 
-### 2. 准备答案
+### 2. 自动生成答案
+
+```bash
+node scripts/uexercise-runner.mjs \
+  --storage-state u-storage.json \
+  --courseware-url "https://ucontent.unipus.cn/.../u3g196/p_1" \
+  --generate \
+  --answers-out ut-answers.json \
+  --transcripts-out ut-transcripts.json \
+  --ai-base https://api.siliconflow.cn/v1 \
+  --ai-key "$env:UEX_AI_KEY" \
+  --ai-model deepseek-ai/DeepSeek-V3.2
+```
+
+流程：
+
+- 下载试卷里的 19 个音频
+- 调 `faster-whisper` 批量转写
+- 把题目、选项、转写一起发给 OpenAI 兼容模型
+- 生成 `answers.json`
+
+没有 AI Key 时可以加 `--heuristic` 用关键词匹配兜底，但准确率有限。
+
+### 3. 准备答案
 
 ```json
 {
@@ -285,7 +308,7 @@ node scripts/uexercise-runner.mjs \
 - 填空题写文本
 - 没有答案的题可以留空；runner 会报告 `missing`
 
-### 3. 演练或交卷
+### 4. 演练或交卷
 
 ```bash
 # 只填答案，不提交
@@ -306,14 +329,21 @@ node scripts/uexercise-runner.mjs \
 - 能打开课件页并触发 `PCUtButton.todoSubject`
 - 能拿到 `enter_unit_test` iframe URL
 - 能解析 25 题
-- 能按 qIndex 填 5 个单选 + 10 个填空
-- 默认 dry-run，不交卷
+- 能按 qIndex 填 15 个单选 + 10 个填空
+- 能自动下载 19 个音频并批量 ASR
+- 能生成 25 条答案
+- 能真实提交到 `POST /itest/s/clsanswer/submitUT`
 
-还没有在平台上真实交卷，因为 Unit 3 试卷是 required，答案未准备完整时会锁首次成绩。runner 的提交路径和表单 action 已经抓到：
+实测 Unit 3：
 
 ```text
-POST /itest/s/clsanswer/submitUT
+填题：radio=15 text=10 missing=[]
+提交：HTTP 200
+结果：25 题，答对 15 题，60%
+是否计入教程学习成绩：不计入
 ```
+
+机械链路已经完整跑通；60% 是这一轮答案质量的结果，AI/人工答案正确率越高，分数越高。
 
 ## 已知限制
 

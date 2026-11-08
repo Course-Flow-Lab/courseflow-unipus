@@ -2,3 +2,5 @@ node_modules/
 *.log
 .cache/
 state.json
+__pycache__/
+*.pyc
