@@ -26,7 +26,26 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
     "answers": { "0": { "score": 0 } }
   }
   ```
-  空答案提交可以成功；带 `user_answer` 的答案结构还在验证，默认关闭自动提交（`enable_task_submit: true` 才启用）。
+  空答案提交可以成功；带 `user_answer` 的答案结构已确认到：
+  ```json
+  {
+    "user_answer": {
+      "qid": "...",
+      "rule": "eq",
+      "answer": {
+        "index": 0,
+        "answer": { "student_answer": { "answers": "A" } },
+        "version": "v3"
+      },
+      "content": ""
+    }
+  }
+  ```
+  但真正计分还依赖 `scoreType`、`question_type`、`versions` 等元数据；目前提交后 `real_score_pct` 仍为 0。
+- 平台默认按“首次得分”记录（`record_every_submit=false`、`record_max_submit=false`），所以“先乱填、再按标准答案重交”无法把分数改回来。
+- 因此题组自动提交默认关闭（`enable_task_submit: true` 才启用）。
+
+实测样本：u2g76（可选任务，`min_score_pct=0`）首次提交后 `pass=1`，但 `score_avg=0`。
 
 已确认可用：
 
