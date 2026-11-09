@@ -1,4 +1,4 @@
-# courseflow-unipus-classic
+# courseflow-unipus
 
 Courseflow 的 U校园**普通版**（`u.unipus.cn`）平台模块，提供课程目录、学习任务、章节题目和单元测试的协议实现。与 AI 版（[courseflow-uai](https://github.com/Course-Flow-Lab/courseflow-uai)，走 `ucontent` ipublish）是两套协议，不要混用配置。
 
