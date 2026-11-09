@@ -38,6 +38,8 @@ var DB_COURSE_ID = (() => {
   return match ? match[1] : "";
 })();
 var BROWSER_STUDY = SETTINGS.browser_study !== false;
+var UNIT_TEST_ENABLED = SETTINGS.enable_unit_test === true;
+var UNIT_TEST_DRY_RUN = SETTINGS.unit_test_dry_run === true;
 var ASR_ENABLED = SETTINGS.asr_enabled !== false;
 var ASR_PYTHON = typeof SETTINGS.asr_python === "string" && SETTINGS.asr_python.trim() ? SETTINGS.asr_python.trim() : "python";
 var ASR_MODEL = typeof SETTINGS.asr_model === "string" && SETTINGS.asr_model.trim() ? SETTINGS.asr_model.trim() : "base.en";
@@ -125,9 +127,9 @@ async function follow(session, startUrl, maxHops = 8) {
     const response2 = await fetcher(url, {
       headers: { ...BROWSER_HEADERS, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" }
     });
-    const location = response2.headers.get("location");
-    if (!location) return { url, response: response2, body: await response2.text() };
-    url = new URL(location, url).toString();
+    const location2 = response2.headers.get("location");
+    if (!location2) return { url, response: response2, body: await response2.text() };
+    url = new URL(location2, url).toString();
   }
   const response = await hostFetchFor(session)(url);
   return { url, response, body: await response.text() };
@@ -454,7 +456,7 @@ async function catalogUnits(params) {
     } catch (error) {
       log("warn", `progress ${unitId} failed: ${errorText(error)}`);
     }
-    const walk = (node, parentId) => {
+    const walk = (node, parentId, grandId) => {
       if (node?.role === "link" && node.url) {
         let exam = null;
         try {
@@ -476,6 +478,7 @@ async function catalogUnits(params) {
             video_id: null,
             selectable: true,
             selectable_note: "quiz-paper-link",
+            courseware_path: grandId && grandId !== unitId ? [unitId, grandId, parentId, String(node.url)] : null,
             exam: {
               exercise_id: String(exam.exerciseId ?? ""),
               exam_id: String(exam.examId ?? ""),
@@ -491,11 +494,11 @@ async function catalogUnits(params) {
         const tab = String(node.tab_type ?? "");
         const base = String(node.base ?? "");
         if (tab !== "text" && tab !== "video" && tab !== "task") {
-          for (const child of node.children ?? []) walk(child, String(node.url));
+          for (const child of node.children ?? []) walk(child, String(node.url), parentId);
           return;
         }
         if (base === "quiz-paper-link") {
-          for (const child of node.children ?? []) walk(child, String(node.url));
+          for (const child of node.children ?? []) walk(child, String(node.url), parentId);
           return;
         }
         const kind = tab === "video" ? "video" : tab === "task" ? "document" : "reading";
@@ -515,9 +518,12 @@ async function catalogUnits(params) {
           selectable_note: base
         });
       }
-      for (const child of node?.children ?? []) walk(child, String(node.url ?? parentId));
+      const nodeUrl = String(node?.url ?? "");
+      const nextParent = nodeUrl || parentId;
+      const nextGrand = nodeUrl ? parentId : grandId;
+      for (const child of node?.children ?? []) walk(child, nextParent, nextGrand);
     };
-    for (const child of unit.children ?? []) walk(child, unitId);
+    for (const child of unit.children ?? []) walk(child, unitId, unitId);
   }
   log("info", `catalog.units course=${courseId} units=${units.length}`);
   return { units };
@@ -1457,14 +1463,549 @@ async function studyShortAnswerApi(session, courseId, groupId, decoded, question
     evidence: { state: submitState, score_pct: scorePct }
   };
 }
+function paperCoursewareUrl(courseId, unit) {
+  const path = Array.isArray(unit?.courseware_path) ? unit.courseware_path.map((item) => String(item ?? "")).filter(Boolean) : [];
+  if (path.length < 2) return null;
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}&appName=3001#/${courseId}/courseware/${path.join("/")}/p_1`;
+}
+function stripOptionPrefix(value) {
+  return String(value ?? "").replace(/^[A-Da-d][.、)]\s*/, "").trim();
+}
+function normalizeAnswer(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+function matchPaperOption(raw, options) {
+  const wanted = normalizeAnswer(raw);
+  if (!wanted) return null;
+  const letter = wanted.match(/^\(?([a-d])\)?(?:[.\s]|$)/);
+  if (letter) {
+    const position = letter[1].charCodeAt(0) - 97;
+    if (options[position]) return options[position];
+  }
+  for (const option of options) {
+    const text = normalizeAnswer(stripOptionPrefix(option.text));
+    if (!text) continue;
+    if (text === wanted || wanted.includes(text) || text.includes(wanted)) return option;
+  }
+  let best = null;
+  let bestScore = 0;
+  for (const option of options) {
+    const text = normalizeAnswer(stripOptionPrefix(option.text));
+    const tokens = text.split(/[^a-z0-9']+/).filter((token) => token.length > 2);
+    const score = tokens.filter((token) => wanted.includes(token)).length / Math.max(1, tokens.length);
+    if (score > bestScore) {
+      bestScore = score;
+      best = option;
+    }
+  }
+  return bestScore >= 0.5 ? best : null;
+}
+function tokenizeSpoken(text) {
+  return String(text ?? "").replace(/[\u2018\u2019]/g, "'").replace(/[\u2013\u2014]/g, "-").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).map((raw) => ({ raw, norm: raw.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "") }));
+}
+function alignPaperBlanks(sectionText, transcript, indexes) {
+  const wanted = new Set(indexes.map(String));
+  const template = tokenizeSpoken(sectionText).map((token) => {
+    const marker = token.raw.match(/^(\d{1,2})\)/);
+    return { ...token, blank: marker && wanted.has(marker[1]) ? marker[1] : null };
+  });
+  const spoken = tokenizeSpoken(transcript);
+  const n = template.length;
+  const m = spoken.length;
+  const answers = {};
+  if (!n || !m) return answers;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i2 = 1; i2 <= n; i2 += 1) {
+    for (let j2 = 1; j2 <= m; j2 += 1) {
+      dp[i2][j2] = template[i2 - 1].norm && template[i2 - 1].norm === spoken[j2 - 1].norm ? dp[i2 - 1][j2 - 1] + 1 : Math.max(dp[i2 - 1][j2], dp[i2][j2 - 1]);
+    }
+  }
+  const aligned = new Array(n).fill(-1);
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (template[i - 1].norm && template[i - 1].norm === spoken[j - 1].norm && dp[i][j] === dp[i - 1][j - 1] + 1) {
+      aligned[i - 1] = j - 1;
+      i -= 1;
+      j -= 1;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  for (let k = 0; k < n; k += 1) {
+    const marker = template[k].blank;
+    if (!marker) continue;
+    let before = -1;
+    let after = -1;
+    for (let x = k - 1; x >= 0; x -= 1) {
+      if (aligned[x] >= 0) {
+        before = aligned[x];
+        break;
+      }
+    }
+    for (let x = k + 1; x < n; x += 1) {
+      if (aligned[x] >= 0) {
+        after = aligned[x];
+        break;
+      }
+    }
+    if (before < 0 || after <= before + 1) continue;
+    const words = spoken.slice(before + 1, after).map((token) => token.raw).filter((word) => /[a-z0-9]/i.test(word));
+    if (!words.length || words.length > 8) continue;
+    answers[marker] = words.join(" ").replace(/^[,;:.\-]+|[,;:.\-]+$/g, "");
+  }
+  return answers;
+}
+function parsePaperAudio(value) {
+  try {
+    const parsed = JSON.parse(String(value));
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item) => typeof item === "string" && /^https?:/.test(item)).filter((item) => !/question_num\.mp3$/i.test(item));
+    }
+  } catch {
+  }
+  const text = String(value ?? "");
+  return /^https?:/.test(text) && !/question_num\.mp3$/i.test(text) ? [text] : [];
+}
+async function paperTranscripts(session, sections) {
+  const map = /* @__PURE__ */ new Map();
+  const urls = [];
+  for (const section of sections ?? []) {
+    for (const value of section.audio ?? []) urls.push(...parsePaperAudio(value));
+    for (const set of section.questions ?? []) {
+      for (const value of set.audio ?? []) urls.push(...parsePaperAudio(value));
+    }
+  }
+  for (const url of [...new Set(urls)]) {
+    if (!url) continue;
+    map.set(url, await transcribeAudio(session, url) || "");
+  }
+  return map;
+}
+function sectionTranscript(section, transcripts) {
+  const own = (section?.audio ?? []).flatMap((value) => parsePaperAudio(value)).map((url) => transcripts.get(url) ?? "").filter(Boolean).join(" ");
+  if (own) return own;
+  const nested = (section?.questions ?? []).flatMap((set) => set.audio ?? []).flatMap((value) => parsePaperAudio(value)).map((url) => transcripts.get(url) ?? "").filter(Boolean).join(" ");
+  if (nested) return nested;
+  return [...transcripts.values()].filter(Boolean).join(" ");
+}
+async function askAiJson(session, prompt) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await hostCall("cw.ai.generate", {
+      session,
+      prompt: attempt === 0 ? prompt : `${prompt}
+\u4E0A\u6B21\u8F93\u51FA\u4E0D\u662F\u5408\u6CD5 JSON\uFF1B\u8FD9\u6B21\u53EA\u8F93\u51FA JSON\u3002`
+    });
+    const raw = String(response?.text ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    try {
+      if (start >= 0 && end > start) return JSON.parse(raw.slice(start, end + 1));
+      return JSON.parse(raw);
+    } catch {
+    }
+  }
+  return null;
+}
+async function solvePaperAnswers(session, details) {
+  const transcripts = await paperTranscripts(session, details.sections ?? []);
+  const answers = {};
+  const missingBlank = [];
+  for (const section of details.sections ?? []) {
+    const blankIndexes = (section.questions ?? []).flatMap((set) => set.indexes ?? []).map(String).filter((index) => {
+      const question = (details.questions ?? []).find((item) => String(item.index) === index);
+      return question && question.type !== "radio";
+    });
+    if (!blankIndexes.length) continue;
+    const transcript = sectionTranscript(section, transcripts);
+    if (!transcript) {
+      missingBlank.push(...blankIndexes);
+      continue;
+    }
+    const blanks = alignPaperBlanks(String(section.text ?? ""), transcript, blankIndexes);
+    for (const [index, value] of Object.entries(blanks)) {
+      if (value) answers[index] = value;
+    }
+    for (const index of blankIndexes) if (!answers[index]) missingBlank.push(index);
+  }
+  for (const index of missingBlank) {
+    const question = (details.questions ?? []).find((item) => String(item.index) === index);
+    if (!question) continue;
+    const section = (details.sections ?? []).find(
+      (item) => (item.questions ?? []).some((set) => (set.indexes ?? []).includes(index))
+    );
+    const result = await askAiJson(session, [
+      "\u4F60\u662F U\u6821\u56ED\u590D\u5408\u5F0F\u542C\u5199\u7B54\u9898\u52A9\u624B\u3002",
+      `\u7A7A\u53F7\uFF1A${index}`,
+      "\u8BD5\u5377\u6BB5\u843D\uFF08\u6570\u5B57\u662F\u7A7A\u53F7\uFF09\uFF1A",
+      String(section?.text ?? "").slice(0, 6e3),
+      "\u542C\u529B\u539F\u6587\uFF1A",
+      sectionTranscript(section, transcripts).slice(0, 6e3),
+      "\u53EA\u586B\u8BE5\u7A7A\u5BF9\u5E94\u7684\u539F\u8BCD\uFF0C\u5FC5\u987B\u4E0E\u542C\u529B\u539F\u6587\u7528\u8BCD\u4E00\u81F4\uFF0C\u4E0D\u8981\u6539\u5199\u3002",
+      '\u53EA\u8F93\u51FA JSON\uFF1A{"answer":"word"}'
+    ].join("\n")).catch(() => null);
+    const value = result?.answer ?? Object.values(result ?? {})[0];
+    if (value !== void 0 && value !== null && String(value).trim()) {
+      answers[index] = String(value).trim();
+    }
+  }
+  for (const question of details.questions ?? []) {
+    if (question.type !== "radio") continue;
+    const section = (details.sections ?? []).find(
+      (item) => (item.questions ?? []).some((set) => (set.indexes ?? []).includes(question.index))
+    );
+    const transcript = sectionTranscript(section, transcripts);
+    const options = question.options ?? [];
+    const prompt = [
+      "\u4F60\u662F U\u6821\u56ED\u542C\u529B\u6D4B\u8BD5\u7B54\u9898\u52A9\u624B\u3002\u4E0B\u9762\u662F\u4E00\u9053\u542C\u529B\u9009\u62E9\u9898\u3002",
+      "\u542C\u529B\u539F\u6587\uFF08\u672B\u5C3E Q: \u662F\u9898\u76EE\uFF09\uFF1A",
+      transcript,
+      "\u9009\u9879\uFF1A",
+      ...options.map((option) => `- ${stripOptionPrefix(option.text)}`),
+      "\u5148\u5B9A\u4F4D\u539F\u6587\u4F9D\u636E\uFF0C\u518D\u9009\u6700\u7B26\u5408\u7684\u4E00\u9879\u3002",
+      '\u53EA\u8F93\u51FA JSON\uFF1A{"answer":"\u6240\u9009\u9009\u9879\u7684\u5B8C\u6574\u539F\u6587"}'
+    ].join("\n");
+    try {
+      const result = await askAiJson(session, prompt);
+      const raw = result?.answer ?? result?.[question.index] ?? Object.values(result ?? {})[0];
+      const matched = matchPaperOption(raw, options);
+      if (matched) answers[question.index] = stripOptionPrefix(matched.text);
+      else if (raw !== void 0 && raw !== null && String(raw).trim()) {
+        answers[question.index] = String(Array.isArray(raw) ? raw[0] : raw).trim();
+      }
+    } catch (error) {
+      log("warn", `paper question ${question.index}: ${errorText(error)}`);
+    }
+  }
+  return answers;
+}
+async function openUnitTestPage() {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (node) => Boolean(node && node.offsetParent !== null);
+  const clickText = (text) => {
+    const target = Array.from(document.querySelectorAll("button, span, div, a")).find((node) => node.children.length === 0 && visible(node) && (node.textContent || "").trim() === text);
+    if (!target) return false;
+    target.click();
+    return true;
+  };
+  for (let i = 0; i < 8; i += 1) {
+    if (!clickText("\u6211\u77E5\u9053\u4E86") && !clickText("\u786E\u5B9A")) break;
+    await sleep(400);
+  }
+  const findStart = () => Array.from(document.querySelectorAll("button")).find((node) => visible(node) && /开始做题|继续答题|开始考试|继续考试/.test(node.innerText || ""));
+  let button = findStart();
+  const startedAt = Date.now();
+  while (!button && Date.now() - startedAt < 2e4) {
+    await sleep(500);
+    button = findStart();
+  }
+  if (!button) {
+    return { ok: false, error: "no_start_button", text: (document.body?.innerText || "").slice(0, 200) };
+  }
+  let triggered = false;
+  const key = Object.keys(button).find((name) => name.startsWith("__react"));
+  let element = key ? button[key]?._currentElement : null;
+  for (let i = 0; i < 8 && element; i += 1) {
+    const instance = element._owner?._instance;
+    if (instance?.todoSubject) {
+      instance.todoSubject({ stopPropagation() {
+      } });
+      triggered = true;
+      break;
+    }
+    element = element._owner?._currentElement ?? null;
+  }
+  if (!triggered) button.click();
+  let src = "";
+  const waited = Date.now();
+  while (Date.now() - waited < 25e3) {
+    const iframe = document.querySelector("#iframe");
+    src = String(iframe?.src ?? "");
+    if (src) break;
+    await sleep(500);
+  }
+  if (src.startsWith("//")) src = `https:${src}`;
+  return { ok: Boolean(src), src };
+}
+function readUnitTestPaper() {
+  const clean = (value) => (value || "").replace(/\s+/g, " ").trim();
+  const groups = /* @__PURE__ */ new Map();
+  for (const input of Array.from(document.querySelectorAll('input[type="radio"]'))) {
+    const index = String(input.getAttribute("qIndex") ?? "");
+    if (!index) continue;
+    if (!groups.has(index)) groups.set(index, { index, type: "radio", options: [] });
+    const label = input.closest("label");
+    groups.get(index).options.push({
+      value: String(input.value),
+      text: clean(label?.innerText)
+    });
+  }
+  for (const input of Array.from(document.querySelectorAll('input[type="text"], textarea'))) {
+    const index = String(input.getAttribute("qIndex") ?? "");
+    if (!index) continue;
+    groups.set(index, { index, type: input.tagName === "TEXTAREA" ? "textarea" : "text" });
+  }
+  const questions = [...groups.values()].sort((a, b) => Number(a.index) - Number(b.index));
+  const sections = Array.from(document.querySelectorAll(".itest-section")).map((section) => {
+    const sets = Array.from(section.querySelectorAll(".itest-ques-set")).map((set) => ({
+      indexes: [...new Set(Array.from(set.querySelectorAll('input[type="radio"], input[type="text"], textarea')).map((input) => input.getAttribute("qIndex")).filter(Boolean))],
+      audio: Array.from(set.querySelectorAll(".itest-hear-reslist span")).map((node) => (node.textContent || "").trim()).filter(Boolean)
+    }));
+    return {
+      title: clean(section.querySelector(".title")?.innerText),
+      text: clean(section.innerText).slice(0, 6e3),
+      audio: Array.from(section.querySelectorAll(".itest-hear-reslist span")).map((node) => (node.textContent || "").trim()).filter(Boolean),
+      questions: sets
+    };
+  });
+  return {
+    url: location.href,
+    title: document.title,
+    ready: Boolean(document.querySelector("#submitAnswerForm, .itest-section")),
+    count: questions.length,
+    questions,
+    sections
+  };
+}
+function fillUnitTestPaper(answerMap) {
+  const result = { radio: 0, text: 0, missing: [] };
+  for (const [index, value] of Object.entries(answerMap)) {
+    const radios = Array.from(document.querySelectorAll(`input[type="radio"][qIndex="${index}"]`));
+    if (radios.length) {
+      const wanted = String(value);
+      let target = radios.find((input2) => {
+        const label = input2.closest("label");
+        const text = (label?.innerText || "").replace(/\s+/g, " ").trim();
+        return text.toLowerCase().includes(wanted.toLowerCase());
+      });
+      if (!target && /^[A-Da-d]$/.test(wanted)) {
+        target = radios.find((input2) => String(input2.value).toUpperCase() === wanted.toUpperCase());
+      }
+      if (target) {
+        (target.closest("label") ?? target).click();
+        result.radio += 1;
+      } else {
+        result.missing.push(index);
+      }
+      continue;
+    }
+    const input = document.querySelector(
+      `input[type="text"][qIndex="${index}"], textarea[qIndex="${index}"]`
+    );
+    if (!input) {
+      result.missing.push(index);
+      continue;
+    }
+    const proto = input.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(input, String(value));
+    else input.value = String(value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new Event("blur", { bubbles: true }));
+    result.text += 1;
+  }
+  return result;
+}
+async function submitUnitTestPaper() {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const clickText = (text2) => {
+    const target = Array.from(document.querySelectorAll(".layui-layer-btn0, .layui-layer-btn a, button, span")).find((node) => node.offsetParent !== null && (node.textContent || "").trim() === text2);
+    if (!target) return false;
+    target.click();
+    return true;
+  };
+  for (let i = 0; i < 6; i += 1) {
+    if (!clickText("\u6211\u77E5\u9053\u4E86") && !clickText("\u786E\u5B9A")) break;
+    await sleep(400);
+  }
+  const submit = document.querySelector("#submit-answer");
+  let submitted = false;
+  if (typeof window.paperSubmit === "function") {
+    window.paperSubmit(1);
+    submitted = true;
+  } else if (submit) {
+    submit.click();
+    submitted = true;
+  } else {
+    const button = Array.from(document.querySelectorAll("button")).find((node) => node.offsetParent !== null && (node.textContent || "").trim() === "\u63D0\u4EA4");
+    if (button) {
+      button.click();
+      submitted = true;
+    }
+  }
+  let confirmed = false;
+  for (let i = 0; i < 10; i += 1) {
+    await sleep(700);
+    if (clickText("\u786E\u8BA4")) {
+      confirmed = true;
+      break;
+    }
+  }
+  let text = "";
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 2e4) {
+    text = (document.body?.innerText || "").replace(/\s+/g, " ");
+    if (/正确率|平均分|答对/.test(text)) break;
+    await sleep(700);
+  }
+  return { submitted, confirmed, text: text.slice(-500) };
+}
+async function paperProgress(session, courseId, groupId, auth) {
+  try {
+    const progress = await fetchText(
+      session,
+      `${UCONTENT_BASE}/api/mobile/user_module/${courseId}/${groupId}/progress/v2/`,
+      annotatorHeaders(auth)
+    );
+    return JSON.parse(progress.text)?.data ?? null;
+  } catch {
+    return null;
+  }
+}
+async function studyQuizPaper(session, courseId, unit, auth) {
+  const groupId = String(unit.id ?? "").split("::")[0];
+  if (!UNIT_TEST_ENABLED) {
+    return {
+      status: "needs_human",
+      reason: "\u5355\u5143\u6D4B\u8BD5\u662F\u72EC\u7ACB\u7684 uexercise \u8BD5\u5377\u5E94\u7528\uFF1B\u8BBE\u7F6E enable_unit_test=true \u624D\u4F1A\u5728\u6A21\u5757\u5185\u81EA\u52A8\u7B54\u9898/\u4EA4\u5377",
+      evidence: { exam: unit.exam ?? null }
+    };
+  }
+  const url = paperCoursewareUrl(courseId, unit);
+  if (!url) {
+    return { status: "needs_human", reason: "\u5355\u5143\u6D4B\u8BD5\u7F3A\u5C11\u8BFE\u4EF6\u8DEF\u5F84", evidence: { exam: unit.exam ?? null } };
+  }
+  let paperPage = null;
+  try {
+    const opened = await hostCall("cw.browser.open", { session, url, purpose: "study" });
+    const first = String(opened?.page ?? "");
+    if (!first) return { status: "needs_human", reason: "\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4" };
+    let examUrl = "";
+    try {
+      const resolved = await hostCall("cw.browser.evaluate", {
+        session,
+        page: first,
+        stage: "save_study",
+        expression: `(${openUnitTestPage.toString()})()`
+      });
+      examUrl = String(resolved?.src ?? "");
+      if (!resolved?.ok) {
+        return {
+          status: "needs_human",
+          reason: `\u6CA1\u6709\u6253\u5F00\u5355\u5143\u6D4B\u8BD5\u8BD5\u5377\uFF1A${String(resolved?.error ?? "unknown")}`,
+          evidence: { courseware_url: url, detail: resolved?.text ?? "" }
+        };
+      }
+    } finally {
+      await hostCall("cw.browser.close", { session, page: first }).catch(() => {
+      });
+    }
+    const openedPaper = await hostCall("cw.browser.open", { session, url: examUrl, purpose: "study" });
+    paperPage = String(openedPaper?.page ?? "");
+    if (!paperPage) return { status: "needs_human", reason: "\u8BD5\u5377\u9875\u9762\u6CA1\u6709\u6253\u5F00" };
+    const details = await hostCall("cw.browser.evaluate", {
+      session,
+      page: paperPage,
+      stage: "save_study",
+      expression: `(${readUnitTestPaper.toString()})()`
+    });
+    if (!details?.ready || !Number(details?.count)) {
+      return {
+        status: "needs_human",
+        reason: "\u8BD5\u5377\u9875\u9762\u6CA1\u6709\u89E3\u6790\u51FA\u9898\u76EE",
+        evidence: { exam_url: examUrl, count: details?.count ?? 0 }
+      };
+    }
+    const answers = await solvePaperAnswers(session, details);
+    const unanswered = (details.questions ?? []).map((question) => String(question.index)).filter((index) => !answers[index]);
+    if (unanswered.length) {
+      return {
+        status: "needs_human",
+        reason: `\u5355\u5143\u6D4B\u8BD5\u6709 ${unanswered.length} \u9898\u6CA1\u6709\u751F\u6210\u7B54\u6848\uFF0C\u672A\u63D0\u4EA4`,
+        evidence: { unanswered, exam: unit.exam ?? null }
+      };
+    }
+    const filled = await hostCall("cw.browser.evaluate", {
+      session,
+      page: paperPage,
+      stage: "save_study",
+      expression: `(${fillUnitTestPaper.toString()})(${JSON.stringify(answers)})`
+    });
+    if (filled?.missing?.length) {
+      return {
+        status: "needs_human",
+        reason: `\u6709 ${filled.missing.length} \u9898\u6CA1\u6709\u586B\u4E0A\uFF0C\u672A\u63D0\u4EA4`,
+        evidence: { filled, exam: unit.exam ?? null }
+      };
+    }
+    if (UNIT_TEST_DRY_RUN) {
+      await hostCall("cw.browser.close", { session, page: paperPage }).catch(() => {
+      });
+      paperPage = null;
+      return {
+        status: "needs_human",
+        reason: "\u5355\u5143\u6D4B\u8BD5\u6F14\u7EC3\u6A21\u5F0F\uFF1A\u5DF2\u89E3\u6790\u5E76\u586B\u597D\u7B54\u6848\uFF0C\u672A\u63D0\u4EA4",
+        evidence: {
+          dry_run: true,
+          count: details.count,
+          filled,
+          answers,
+          exam: unit.exam ?? null
+        }
+      };
+    }
+    let submitResult = null;
+    try {
+      submitResult = await hostCall("cw.browser.evaluate", {
+        session,
+        page: paperPage,
+        stage: "save_study",
+        expression: `(${submitUnitTestPaper.toString()})()`
+      });
+    } catch (error) {
+      log("warn", `paper submit evaluate failed: ${errorText(error)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 4e3));
+    await hostCall("cw.browser.close", { session, page: paperPage }).catch(() => {
+    });
+    paperPage = null;
+    const progress = await paperProgress(session, courseId, groupId, auth);
+    const state = Number(progress?.state?.state ?? 0);
+    const scorePct = Number(progress?.state?.real_score_pct ?? progress?.state?.score_pct ?? 0);
+    const score = progress?.state?.score ?? null;
+    if (state === 1) {
+      return {
+        status: "completed",
+        evidence: {
+          platform_confirmed: true,
+          browser: true,
+          score,
+          score_pct: scorePct,
+          exam: unit.exam ?? null,
+          submit: submitResult?.text ?? ""
+        },
+        checkpoint: { phase: "done" }
+      };
+    }
+    return {
+      status: "needs_human",
+      reason: `\u5355\u5143\u6D4B\u8BD5\u5DF2\u63D0\u4EA4\u4F46\u5E73\u53F0\u672A\u786E\u8BA4\uFF08state ${state}\uFF09`,
+      evidence: { state, score_pct: scorePct, submit: submitResult, exam: unit.exam ?? null }
+    };
+  } catch (error) {
+    return { status: "needs_human", reason: `\u5355\u5143\u6D4B\u8BD5\u6D41\u7A0B\u5931\u8D25\uFF1A${errorText(error)}` };
+  } finally {
+    if (paperPage) await hostCall("cw.browser.close", { session, page: paperPage }).catch(() => {
+    });
+  }
+}
 async function studyTask(session, courseId, unit, auth) {
   const groupId = String(unit.id ?? "").split("::")[0];
   if (String(unit.selectable_note ?? "") === "quiz-paper-link" || unit.exam) {
-    return {
-      status: "needs_human",
-      reason: "\u5355\u5143\u6D4B\u8BD5\u662F\u72EC\u7ACB\u7684 uexercise \u8BD5\u5377\u5E94\u7528\uFF0C\u5F53\u524D\u53EA\u63A5\u5165\u76EE\u5F55\uFF0C\u4E0D\u81EA\u52A8\u7B54\u9898/\u4EA4\u5377",
-      evidence: { exam: unit.exam ?? null }
-    };
+    return studyQuizPaper(session, courseId, unit, auth);
   }
   let minScorePct = 0;
   let progressData = null;

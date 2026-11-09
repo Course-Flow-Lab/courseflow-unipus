@@ -347,6 +347,20 @@ node scripts/uexercise-runner.mjs \
 
 选择题的剩余误差主要来自语义相近选项（如 "America is large..." vs "America has more tourist attractions than Europe"）；听写空位由原文对齐产出，基本不会改写。
 
+### 5. 模块内直接跑（部署方式）
+
+设置 `enable_unit_test=true` 后，`study.step` 对 `quiz-paper-link` 不再返回 `needs_human`，而是在模块内用框架的 `cw.browser` 完成整条链路：
+
+1. 打开课件页，调 `todoSubject()` 拿 `enter_unit_test` 地址
+2. 打开试卷页，解析 25 题（题目/选项/段落/音频）
+3. 用 `cw.net.fetch` 下载音频，本地 ASR 转写
+4. 选择题逐题带转写给模型，要求返回选项原文；听写空位按原文对齐抠词
+5. 填题后调用 `paperSubmit(1)`，再用 `progress/v2` 确认 `state` 和 `score_pct`
+
+`unit_test_dry_run=true` 时只做到第 4 步（填好不交），返回 `needs_human`，便于部署前演练。
+
+实测：Unit 3 演练（`u3g196`）15 道选择全对、10 个听写空全对；真实提交路径在已交卷的 Unit 3 上验证通过，不影响首考记录。
+
 ## 已知限制
 
 - 平台强制单会话：账号在手机/其他浏览器登录时，`getToken` 会 302 到 `repeatLogin`，模块返回 `platform_session_conflict`。需要先在官方页面退出，或让模块自动把其他会话踢下线。
@@ -357,7 +371,7 @@ node scripts/uexercise-runner.mjs \
 - ASR 是本地 CPU 转写，2.5 分钟音频约 20 秒；如果框架调用预算更紧，可把 `asr_model` 改成 `tiny.en`，或提前把模型缓存好。
 - ASR 依赖 `python`、`faster-whisper`、`ffmpeg`；模块安装时会把 `scripts/transcribe_audio.py` 一起复制。
 - 口语/录音题（roleplay、presentation、sentencesforrecord）不做自动提交，统一返回 `needs_human`。
-- 单元测试 `quiz-paper-link` 已纳入目录，并带 `exercise_id`/`exam_id` 元数据；它实际是 `uexercise.unipus.cn` 的独立试卷应用（25 题，含听力/听写）。模块内仍返回 `needs_human`，自动答题/交卷请使用独立的 `scripts/uexercise-runner.mjs`。
+- 单元测试 `quiz-paper-link` 已纳入目录，并带 `exercise_id`/`exam_id` 元数据；它实际是 `uexercise.unipus.cn` 的独立试卷应用（25 题，含听力/听写）。默认仍返回 `needs_human`；设置 `enable_unit_test=true` 后，模块会用 `cw.browser` 打开课件页→触发 `todoSubject`→进试卷→转写音频→生成答案→填题→交卷，并用 `progress/v2` 确认分数。`unit_test_dry_run=true` 可只填不交。独立 runner 保留作为调试/离线验分工具。
 
 ## 安装
 
@@ -393,6 +407,8 @@ npm run cli -- module config unipus_classic '{
 | `content_base_url` | 默认 `https://ucontent.unipus.cn` |
 | `browser_study` | 默认 `true`；用官方浏览器（Playwright/CDP）做客观题 |
 | `enable_task_submit` | 默认 `false`；`browser_study=false` 时允许走 API 提交客观题 |
+| `enable_unit_test` | 默认 `false`；开启后单元测试（`quiz-paper-link`）在模块内用 `cw.browser` 走完整试卷流程 |
+| `unit_test_dry_run` | 默认 `false`；开启后只解析/生成/填答案，不交卷，方便部署前演练 |
 | `asr_enabled` | 默认 `true`；没有原文/VTT 时用 faster-whisper 转写音频 |
 | `asr_python` | 默认 `python`；指向装有 `faster-whisper` 的 Python |
 | `asr_model` | 默认 `base.en`；可改 `tiny.en` 降低耗时 |

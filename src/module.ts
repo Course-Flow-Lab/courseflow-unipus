@@ -48,6 +48,8 @@ const DB_COURSE_ID = (() => {
   return match ? match[1] : '';
 })();
 const BROWSER_STUDY = SETTINGS.browser_study !== false;
+const UNIT_TEST_ENABLED = SETTINGS.enable_unit_test === true;
+const UNIT_TEST_DRY_RUN = SETTINGS.unit_test_dry_run === true;
 const ASR_ENABLED = SETTINGS.asr_enabled !== false;
 const ASR_PYTHON =
   typeof SETTINGS.asr_python === 'string' && SETTINGS.asr_python.trim()
@@ -524,7 +526,7 @@ async function catalogUnits(params: any) {
       log('warn', `progress ${unitId} failed: ${errorText(error)}`);
     }
 
-    const walk = (node: any, parentId: string) => {
+    const walk = (node: any, parentId: string, grandId: string) => {
       if (node?.role === 'link' && node.url) {
         let exam: any = null;
         try {
@@ -545,6 +547,9 @@ async function catalogUnits(params: any) {
             video_id: null,
             selectable: true,
             selectable_note: 'quiz-paper-link',
+            courseware_path: grandId && grandId !== unitId
+              ? [unitId, grandId, parentId, String(node.url)]
+              : null,
             exam: {
               exercise_id: String(exam.exerciseId ?? ''),
               exam_id: String(exam.examId ?? ''),
@@ -560,11 +565,11 @@ async function catalogUnits(params: any) {
         const tab = String(node.tab_type ?? '');
         const base = String(node.base ?? '');
         if (tab !== 'text' && tab !== 'video' && tab !== 'task') {
-          for (const child of node.children ?? []) walk(child, String(node.url));
+          for (const child of node.children ?? []) walk(child, String(node.url), parentId);
           return;
         }
         if (base === 'quiz-paper-link') {
-          for (const child of node.children ?? []) walk(child, String(node.url));
+          for (const child of node.children ?? []) walk(child, String(node.url), parentId);
           return;
         }
         const kind = tab === 'video' ? 'video' : tab === 'task' ? 'document' : 'reading';
@@ -584,10 +589,13 @@ async function catalogUnits(params: any) {
           selectable_note: base,
         });
       }
-      for (const child of node?.children ?? []) walk(child, String(node.url ?? parentId));
+      const nodeUrl = String(node?.url ?? '');
+      const nextParent = nodeUrl || parentId;
+      const nextGrand = nodeUrl ? parentId : grandId;
+      for (const child of node?.children ?? []) walk(child, nextParent, nextGrand);
     };
 
-    for (const child of unit.children ?? []) walk(child, unitId);
+    for (const child of unit.children ?? []) walk(child, unitId, unitId);
   }
 
   log('info', `catalog.units course=${courseId} units=${units.length}`);
@@ -1713,14 +1721,612 @@ async function studyShortAnswerApi(
   };
 }
 
+/* ------------------------------------------------------- unit test paper */
+
+function paperCoursewareUrl(courseId: string, unit: any): string | null {
+  const path: string[] = Array.isArray(unit?.courseware_path)
+    ? unit.courseware_path.map((item: any) => String(item ?? '')).filter(Boolean)
+    : [];
+  if (path.length < 2) return null;
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}&appName=3001#/${courseId}/courseware/${path.join('/')}/p_1`;
+}
+
+function stripOptionPrefix(value: any): string {
+  return String(value ?? '').replace(/^[A-Da-d][.、)]\s*/, '').trim();
+}
+
+function normalizeAnswer(value: any): string {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function matchPaperOption(raw: any, options: any[]): any | null {
+  const wanted = normalizeAnswer(raw);
+  if (!wanted) return null;
+  const letter = wanted.match(/^\(?([a-d])\)?(?:[.\s]|$)/);
+  if (letter) {
+    const position = letter[1].charCodeAt(0) - 97;
+    if (options[position]) return options[position];
+  }
+  for (const option of options) {
+    const text = normalizeAnswer(stripOptionPrefix(option.text));
+    if (!text) continue;
+    if (text === wanted || wanted.includes(text) || text.includes(wanted)) return option;
+  }
+  let best: any = null;
+  let bestScore = 0;
+  for (const option of options) {
+    const text = normalizeAnswer(stripOptionPrefix(option.text));
+    const tokens = text.split(/[^a-z0-9']+/).filter((token) => token.length > 2);
+    const score = tokens.filter((token) => wanted.includes(token)).length / Math.max(1, tokens.length);
+    if (score > bestScore) {
+      bestScore = score;
+      best = option;
+    }
+  }
+  return bestScore >= 0.5 ? best : null;
+}
+
+function tokenizeSpoken(text: string): Array<{ raw: string; norm: string }> {
+  return String(text ?? '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map((raw) => ({ raw, norm: raw.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '') }));
+}
+
+// Dictation answers are spoken words: align the passage template (which keeps
+// "16)" markers) against the transcript and read each blank from the gap.
+function alignPaperBlanks(sectionText: string, transcript: string, indexes: string[]) {
+  const wanted = new Set(indexes.map(String));
+  const template = tokenizeSpoken(sectionText).map((token) => {
+    const marker = token.raw.match(/^(\d{1,2})\)/);
+    return { ...token, blank: marker && wanted.has(marker[1]) ? marker[1] : null };
+  });
+  const spoken = tokenizeSpoken(transcript);
+  const n = template.length;
+  const m = spoken.length;
+  const answers: Record<string, string> = {};
+  if (!n || !m) return answers;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      dp[i][j] = template[i - 1].norm && template[i - 1].norm === spoken[j - 1].norm
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  const aligned = new Array<number>(n).fill(-1);
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (template[i - 1].norm && template[i - 1].norm === spoken[j - 1].norm && dp[i][j] === dp[i - 1][j - 1] + 1) {
+      aligned[i - 1] = j - 1;
+      i -= 1;
+      j -= 1;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  for (let k = 0; k < n; k += 1) {
+    const marker = template[k].blank;
+    if (!marker) continue;
+    let before = -1;
+    let after = -1;
+    for (let x = k - 1; x >= 0; x -= 1) {
+      if (aligned[x] >= 0) { before = aligned[x]; break; }
+    }
+    for (let x = k + 1; x < n; x += 1) {
+      if (aligned[x] >= 0) { after = aligned[x]; break; }
+    }
+    if (before < 0 || after <= before + 1) continue;
+    const words = spoken.slice(before + 1, after)
+      .map((token) => token.raw)
+      .filter((word) => /[a-z0-9]/i.test(word));
+    if (!words.length || words.length > 8) continue;
+    answers[marker] = words.join(' ').replace(/^[,;:.\-]+|[,;:.\-]+$/g, '');
+  }
+  return answers;
+}
+
+function parsePaperAudio(value: any): string[] {
+  try {
+    const parsed = JSON.parse(String(value));
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item) => typeof item === 'string' && /^https?:/.test(item))
+        .filter((item) => !/question_num\.mp3$/i.test(item));
+    }
+  } catch {}
+  const text = String(value ?? '');
+  return /^https?:/.test(text) && !/question_num\.mp3$/i.test(text) ? [text] : [];
+}
+
+async function paperTranscripts(session: string, sections: any[]): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const urls: string[] = [];
+  for (const section of sections ?? []) {
+    for (const value of section.audio ?? []) urls.push(...parsePaperAudio(value));
+    for (const set of section.questions ?? []) {
+      for (const value of set.audio ?? []) urls.push(...parsePaperAudio(value));
+    }
+  }
+  for (const url of [...new Set(urls)]) {
+    if (!url) continue;
+    map.set(url, (await transcribeAudio(session, url)) || '');
+  }
+  return map;
+}
+
+function sectionTranscript(section: any, transcripts: Map<string, string>): string {
+  const own = (section?.audio ?? [])
+    .flatMap((value: string) => parsePaperAudio(value))
+    .map((url: string) => transcripts.get(url) ?? '')
+    .filter(Boolean)
+    .join(' ');
+  if (own) return own;
+  const nested = (section?.questions ?? [])
+    .flatMap((set: any) => set.audio ?? [])
+    .flatMap((value: string) => parsePaperAudio(value))
+    .map((url: string) => transcripts.get(url) ?? '')
+    .filter(Boolean)
+    .join(' ');
+  if (nested) return nested;
+  return [...transcripts.values()].filter(Boolean).join(' ');
+}
+
+async function askAiJson(session: string, prompt: string): Promise<any | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await hostCall('cw.ai.generate', {
+      session,
+      prompt: attempt === 0 ? prompt : `${prompt}\n上次输出不是合法 JSON；这次只输出 JSON。`,
+    });
+    const raw = String((response as any)?.text ?? '')
+      .trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    try {
+      if (start >= 0 && end > start) return JSON.parse(raw.slice(start, end + 1));
+      return JSON.parse(raw);
+    } catch {
+      // retry
+    }
+  }
+  return null;
+}
+
+async function solvePaperAnswers(session: string, details: any) {
+  const transcripts = await paperTranscripts(session, details.sections ?? []);
+  const answers: Record<string, string> = {};
+  const missingBlank: string[] = [];
+
+  for (const section of details.sections ?? []) {
+    const blankIndexes = (section.questions ?? [])
+      .flatMap((set: any) => set.indexes ?? [])
+      .map(String)
+      .filter((index: string) => {
+        const question = (details.questions ?? []).find((item: any) => String(item.index) === index);
+        return question && question.type !== 'radio';
+      });
+    if (!blankIndexes.length) continue;
+    const transcript = sectionTranscript(section, transcripts);
+    if (!transcript) {
+      missingBlank.push(...blankIndexes);
+      continue;
+    }
+    const blanks = alignPaperBlanks(String(section.text ?? ''), transcript, blankIndexes);
+    for (const [index, value] of Object.entries(blanks)) {
+      if (value) answers[index] = value;
+    }
+    for (const index of blankIndexes) if (!answers[index]) missingBlank.push(index);
+  }
+
+  for (const index of missingBlank) {
+    const question = (details.questions ?? []).find((item: any) => String(item.index) === index);
+    if (!question) continue;
+    const section = (details.sections ?? []).find((item: any) =>
+      (item.questions ?? []).some((set: any) => (set.indexes ?? []).includes(index)),
+    );
+    const result = await askAiJson(session, [
+      '你是 U校园复合式听写答题助手。',
+      `空号：${index}`,
+      '试卷段落（数字是空号）：',
+      String(section?.text ?? '').slice(0, 6000),
+      '听力原文：',
+      sectionTranscript(section, transcripts).slice(0, 6000),
+      '只填该空对应的原词，必须与听力原文用词一致，不要改写。',
+      '只输出 JSON：{"answer":"word"}',
+    ].join('\n')).catch(() => null);
+    const value = result?.answer ?? Object.values(result ?? {})[0];
+    if (value !== undefined && value !== null && String(value).trim()) {
+      answers[index] = String(value).trim();
+    }
+  }
+
+  for (const question of details.questions ?? []) {
+    if (question.type !== 'radio') continue;
+    const section = (details.sections ?? []).find((item: any) =>
+      (item.questions ?? []).some((set: any) => (set.indexes ?? []).includes(question.index)),
+    );
+    const transcript = sectionTranscript(section, transcripts);
+    const options = question.options ?? [];
+    const prompt = [
+      '你是 U校园听力测试答题助手。下面是一道听力选择题。',
+      '听力原文（末尾 Q: 是题目）：',
+      transcript,
+      '选项：',
+      ...options.map((option: any) => `- ${stripOptionPrefix(option.text)}`),
+      '先定位原文依据，再选最符合的一项。',
+      '只输出 JSON：{"answer":"所选选项的完整原文"}',
+    ].join('\n');
+    try {
+      const result = await askAiJson(session, prompt);
+      const raw = result?.answer ?? result?.[question.index] ?? Object.values(result ?? {})[0];
+      const matched = matchPaperOption(raw, options);
+      if (matched) answers[question.index] = stripOptionPrefix(matched.text);
+      else if (raw !== undefined && raw !== null && String(raw).trim()) {
+        answers[question.index] = String(Array.isArray(raw) ? raw[0] : raw).trim();
+      }
+    } catch (error) {
+      log('warn', `paper question ${question.index}: ${errorText(error)}`);
+    }
+  }
+
+  return answers;
+}
+
+// Runs inside the courseware page: trigger "开始做题" and return the paper URL.
+async function openUnitTestPage() {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (node: any) => Boolean(node && node.offsetParent !== null);
+  const clickText = (text: string) => {
+    const target = Array.from(document.querySelectorAll('button, span, div, a'))
+      .find((node: any) => node.children.length === 0 && visible(node) && (node.textContent || '').trim() === text);
+    if (!target) return false;
+    (target as any).click();
+    return true;
+  };
+  for (let i = 0; i < 8; i += 1) {
+    if (!clickText('我知道了') && !clickText('确定')) break;
+    await sleep(400);
+  }
+  const findStart = () => Array.from(document.querySelectorAll('button'))
+    .find((node: any) => visible(node) && /开始做题|继续答题|开始考试|继续考试/.test(node.innerText || ''));
+  let button: any = findStart();
+  const startedAt = Date.now();
+  while (!button && Date.now() - startedAt < 20000) {
+    await sleep(500);
+    button = findStart();
+  }
+  if (!button) {
+    return { ok: false, error: 'no_start_button', text: (document.body?.innerText || '').slice(0, 200) };
+  }
+  let triggered = false;
+  const key = Object.keys(button).find((name) => name.startsWith('__react'));
+  let element = key ? (button as any)[key]?._currentElement : null;
+  for (let i = 0; i < 8 && element; i += 1) {
+    const instance = element._owner?._instance;
+    if (instance?.todoSubject) {
+      instance.todoSubject({ stopPropagation() {} });
+      triggered = true;
+      break;
+    }
+    element = element._owner?._currentElement ?? null;
+  }
+  if (!triggered) (button as any).click();
+  let src = '';
+  const waited = Date.now();
+  while (Date.now() - waited < 25000) {
+    const iframe = document.querySelector('#iframe') as any;
+    src = String(iframe?.src ?? '');
+    if (src) break;
+    await sleep(500);
+  }
+  if (src.startsWith('//')) src = `https:${src}`;
+  return { ok: Boolean(src), src };
+}
+
+function readUnitTestPaper() {
+  const clean = (value: any) => (value || '').replace(/\s+/g, ' ').trim();
+  const groups = new Map<string, any>();
+  for (const input of Array.from(document.querySelectorAll('input[type="radio"]')) as any[]) {
+    const index = String(input.getAttribute('qIndex') ?? '');
+    if (!index) continue;
+    if (!groups.has(index)) groups.set(index, { index, type: 'radio', options: [] });
+    const label = input.closest('label');
+    groups.get(index).options.push({
+      value: String(input.value),
+      text: clean(label?.innerText),
+    });
+  }
+  for (const input of Array.from(document.querySelectorAll('input[type="text"], textarea')) as any[]) {
+    const index = String(input.getAttribute('qIndex') ?? '');
+    if (!index) continue;
+    groups.set(index, { index, type: input.tagName === 'TEXTAREA' ? 'textarea' : 'text' });
+  }
+  const questions = [...groups.values()].sort((a: any, b: any) => Number(a.index) - Number(b.index));
+  const sections = (Array.from(document.querySelectorAll('.itest-section')) as any[]).map((section: any) => {
+    const sets = (Array.from(section.querySelectorAll('.itest-ques-set')) as any[]).map((set: any) => ({
+      indexes: [...new Set((Array.from(set.querySelectorAll('input[type="radio"], input[type="text"], textarea')) as any[])
+        .map((input: any) => input.getAttribute('qIndex'))
+        .filter(Boolean))],
+      audio: (Array.from(set.querySelectorAll('.itest-hear-reslist span')) as any[])
+        .map((node: any) => (node.textContent || '').trim())
+        .filter(Boolean),
+    }));
+    return {
+      title: clean(section.querySelector('.title')?.innerText),
+      text: clean(section.innerText).slice(0, 6000),
+      audio: (Array.from(section.querySelectorAll('.itest-hear-reslist span')) as any[])
+        .map((node: any) => (node.textContent || '').trim())
+        .filter(Boolean),
+      questions: sets,
+    };
+  });
+  return {
+    url: location.href,
+    title: document.title,
+    ready: Boolean(document.querySelector('#submitAnswerForm, .itest-section')),
+    count: questions.length,
+    questions,
+    sections,
+  };
+}
+
+function fillUnitTestPaper(answerMap: Record<string, string>) {
+  const result = { radio: 0, text: 0, missing: [] as string[] };
+  for (const [index, value] of Object.entries(answerMap)) {
+    const radios = Array.from(document.querySelectorAll(`input[type="radio"][qIndex="${index}"]`)) as any[];
+    if (radios.length) {
+      const wanted = String(value);
+      let target = radios.find((input: any) => {
+        const label = input.closest('label');
+        const text = (label?.innerText || '').replace(/\s+/g, ' ').trim();
+        return text.toLowerCase().includes(wanted.toLowerCase());
+      });
+      if (!target && /^[A-Da-d]$/.test(wanted)) {
+        target = radios.find((input: any) => String(input.value).toUpperCase() === wanted.toUpperCase());
+      }
+      if (target) {
+        (target.closest('label') ?? target).click();
+        result.radio += 1;
+      } else {
+        result.missing.push(index);
+      }
+      continue;
+    }
+    const input: any = document.querySelector(
+      `input[type="text"][qIndex="${index}"], textarea[qIndex="${index}"]`,
+    );
+    if (!input) {
+      result.missing.push(index);
+      continue;
+    }
+    const proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(input, String(value));
+    else input.value = String(value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.dispatchEvent(new Event('blur', { bubbles: true }));
+    result.text += 1;
+  }
+  return result;
+}
+
+async function submitUnitTestPaper() {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const clickText = (text: string) => {
+    const target = Array.from(document.querySelectorAll('.layui-layer-btn0, .layui-layer-btn a, button, span'))
+      .find((node: any) => node.offsetParent !== null && (node.textContent || '').trim() === text);
+    if (!target) return false;
+    (target as any).click();
+    return true;
+  };
+  for (let i = 0; i < 6; i += 1) {
+    if (!clickText('我知道了') && !clickText('确定')) break;
+    await sleep(400);
+  }
+  const submit = document.querySelector('#submit-answer') as any;
+  let submitted = false;
+  if (typeof (window as any).paperSubmit === 'function') {
+    (window as any).paperSubmit(1);
+    submitted = true;
+  } else if (submit) {
+    submit.click();
+    submitted = true;
+  } else {
+    const button = (Array.from(document.querySelectorAll('button')) as any[])
+      .find((node: any) => node.offsetParent !== null && (node.textContent || '').trim() === '提交');
+    if (button) {
+      button.click();
+      submitted = true;
+    }
+  }
+  let confirmed = false;
+  for (let i = 0; i < 10; i += 1) {
+    await sleep(700);
+    if (clickText('确认')) {
+      confirmed = true;
+      break;
+    }
+  }
+  let text = '';
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 20000) {
+    text = (document.body?.innerText || '').replace(/\s+/g, ' ');
+    if (/正确率|平均分|答对/.test(text)) break;
+    await sleep(700);
+  }
+  return { submitted, confirmed, text: text.slice(-500) };
+}
+
+async function paperProgress(session: string, courseId: string, groupId: string, auth: any) {
+  try {
+    const progress = await fetchText(
+      session,
+      `${UCONTENT_BASE}/api/mobile/user_module/${courseId}/${groupId}/progress/v2/`,
+      annotatorHeaders(auth),
+    );
+    return JSON.parse(progress.text)?.data ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function studyQuizPaper(session: string, courseId: string, unit: any, auth: any) {
+  const groupId = String(unit.id ?? '').split('::')[0];
+  if (!UNIT_TEST_ENABLED) {
+    return {
+      status: 'needs_human',
+      reason: '单元测试是独立的 uexercise 试卷应用；设置 enable_unit_test=true 才会在模块内自动答题/交卷',
+      evidence: { exam: unit.exam ?? null },
+    };
+  }
+  const url = paperCoursewareUrl(courseId, unit);
+  if (!url) {
+    return { status: 'needs_human', reason: '单元测试缺少课件路径', evidence: { exam: unit.exam ?? null } };
+  }
+
+  let paperPage: string | null = null;
+  try {
+    const opened = await hostCall('cw.browser.open', { session, url, purpose: 'study' });
+    const first = String(opened?.page ?? '');
+    if (!first) return { status: 'needs_human', reason: '官方浏览器没有返回页面句柄' };
+    let examUrl = '';
+    try {
+      const resolved = await hostCall('cw.browser.evaluate', {
+        session,
+        page: first,
+        stage: 'save_study',
+        expression: `(${openUnitTestPage.toString()})()`,
+      });
+      examUrl = String(resolved?.src ?? '');
+      if (!resolved?.ok) {
+        return {
+          status: 'needs_human',
+          reason: `没有打开单元测试试卷：${String(resolved?.error ?? 'unknown')}`,
+          evidence: { courseware_url: url, detail: resolved?.text ?? '' },
+        };
+      }
+    } finally {
+      await hostCall('cw.browser.close', { session, page: first }).catch(() => {});
+    }
+
+    const openedPaper = await hostCall('cw.browser.open', { session, url: examUrl, purpose: 'study' });
+    paperPage = String(openedPaper?.page ?? '');
+    if (!paperPage) return { status: 'needs_human', reason: '试卷页面没有打开' };
+    const details = await hostCall('cw.browser.evaluate', {
+      session,
+      page: paperPage,
+      stage: 'save_study',
+      expression: `(${readUnitTestPaper.toString()})()`,
+    });
+    if (!details?.ready || !Number(details?.count)) {
+      return {
+        status: 'needs_human',
+        reason: '试卷页面没有解析出题目',
+        evidence: { exam_url: examUrl, count: details?.count ?? 0 },
+      };
+    }
+
+    const answers = await solvePaperAnswers(session, details);
+    const unanswered = (details.questions ?? [])
+      .map((question: any) => String(question.index))
+      .filter((index: string) => !answers[index]);
+    if (unanswered.length) {
+      return {
+        status: 'needs_human',
+        reason: `单元测试有 ${unanswered.length} 题没有生成答案，未提交`,
+        evidence: { unanswered, exam: unit.exam ?? null },
+      };
+    }
+
+    const filled = await hostCall('cw.browser.evaluate', {
+      session,
+      page: paperPage,
+      stage: 'save_study',
+      expression: `(${fillUnitTestPaper.toString()})(${JSON.stringify(answers)})`,
+    });
+    if (filled?.missing?.length) {
+      return {
+        status: 'needs_human',
+        reason: `有 ${filled.missing.length} 题没有填上，未提交`,
+        evidence: { filled, exam: unit.exam ?? null },
+      };
+    }
+
+    if (UNIT_TEST_DRY_RUN) {
+      await hostCall('cw.browser.close', { session, page: paperPage }).catch(() => {});
+      paperPage = null;
+      return {
+        status: 'needs_human',
+        reason: '单元测试演练模式：已解析并填好答案，未提交',
+        evidence: {
+          dry_run: true,
+          count: details.count,
+          filled,
+          answers,
+          exam: unit.exam ?? null,
+        },
+      };
+    }
+
+    let submitResult: any = null;
+    try {
+      submitResult = await hostCall('cw.browser.evaluate', {
+        session,
+        page: paperPage,
+        stage: 'save_study',
+        expression: `(${submitUnitTestPaper.toString()})()`,
+      });
+    } catch (error) {
+      log('warn', `paper submit evaluate failed: ${errorText(error)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await hostCall('cw.browser.close', { session, page: paperPage }).catch(() => {});
+    paperPage = null;
+
+    const progress = await paperProgress(session, courseId, groupId, auth);
+    const state = Number(progress?.state?.state ?? 0);
+    const scorePct = Number(progress?.state?.real_score_pct ?? progress?.state?.score_pct ?? 0);
+    const score = progress?.state?.score ?? null;
+    if (state === 1) {
+      return {
+        status: 'completed',
+        evidence: {
+          platform_confirmed: true,
+          browser: true,
+          score,
+          score_pct: scorePct,
+          exam: unit.exam ?? null,
+          submit: submitResult?.text ?? '',
+        },
+        checkpoint: { phase: 'done' },
+      };
+    }
+    return {
+      status: 'needs_human',
+      reason: `单元测试已提交但平台未确认（state ${state}）`,
+      evidence: { state, score_pct: scorePct, submit: submitResult, exam: unit.exam ?? null },
+    };
+  } catch (error) {
+    return { status: 'needs_human', reason: `单元测试流程失败：${errorText(error)}` };
+  } finally {
+    if (paperPage) await hostCall('cw.browser.close', { session, page: paperPage }).catch(() => {});
+  }
+}
+
 async function studyTask(session: string, courseId: string, unit: any, auth: any) {
   const groupId = String(unit.id ?? '').split('::')[0];
   if (String(unit.selectable_note ?? '') === 'quiz-paper-link' || unit.exam) {
-    return {
-      status: 'needs_human',
-      reason: '单元测试是独立的 uexercise 试卷应用，当前只接入目录，不自动答题/交卷',
-      evidence: { exam: unit.exam ?? null },
-    };
+    return studyQuizPaper(session, courseId, unit, auth);
   }
   let minScorePct = 0;
   let progressData: any = null;
