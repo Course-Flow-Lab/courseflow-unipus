@@ -98,13 +98,15 @@ Courseflow 的 U校园**普通版**（`u.unipus.cn`）模块，和 AI 版（`uco
 
 选择题现在会把 `content[].audio.script` 的听力原文、`content[].scoop.html` 的阅读材料和 `content[].video.file` 的 VTT 字幕一起注入模型 prompt，不再只靠题干和选项猜答案。没有原文的题组会退回只发题干和选项。
 
-如果 `audio.script` 和 VTT 都没有，模块会下载音频并调用 `scripts/transcribe_audio.py` 做本地转写：
+如果 `audio.script` 和 VTT 都没有，模块会下载音频再转写：
 
-- 依赖 `faster-whisper` 和 `ffmpeg`
-- 默认模型 `base.en`
-- HuggingFace 下载默认走 `https://hf-mirror.com`，可用 `HF_ENDPOINT` 覆盖
+- 优先调用宿主的 `cw.asr.transcribe`（清单需声明 `asr: true`）：模块不写临时文件、不起子进程，能跑在框架的模块沙箱里
+- 宿主没有 ASR 服务时，回退到本地 `scripts/transcribe_audio.py`：
+  - 依赖 `faster-whisper` 和 `ffmpeg`
+  - 默认模型 `base.en`
+  - HuggingFace 下载默认走 `https://hf-mirror.com`，可用 `HF_ENDPOINT` 覆盖
+  - 典型 2.5 分钟音频约 20 秒完成
 - 转写文本会缓存到模块进程内，避免同一任务重复跑
-- 典型 2.5 分钟音频约 20 秒完成
 
 实测 `u4g624` 这类没有原文的多选题：ASR 得到 2285 字符，提交 100 分。
 

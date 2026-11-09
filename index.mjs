@@ -1898,6 +1898,7 @@ async function studyQuizPaper(session, courseId, unit, auth) {
     return { status: "needs_human", reason: "\u5355\u5143\u6D4B\u8BD5\u7F3A\u5C11\u8BFE\u4EF6\u8DEF\u5F84", evidence: { exam: unit.exam ?? null } };
   }
   let paperPage = null;
+  let keepAlive = null;
   try {
     const opened = await hostCall("cw.browser.open", { session, url, purpose: "study" });
     const first = String(opened?.page ?? "");
@@ -1925,6 +1926,17 @@ async function studyQuizPaper(session, courseId, unit, auth) {
     const openedPaper = await hostCall("cw.browser.open", { session, url: examUrl, purpose: "study" });
     paperPage = String(openedPaper?.page ?? "");
     if (!paperPage) return { status: "needs_human", reason: "\u8BD5\u5377\u9875\u9762\u6CA1\u6709\u6253\u5F00" };
+    keepAlive = setInterval(() => {
+      if (!paperPage) return;
+      void hostCall("cw.browser.evaluate", {
+        session,
+        page: paperPage,
+        stage: "read",
+        expression: "1"
+      }).catch(() => {
+      });
+    }, 45e3);
+    keepAlive.unref?.();
     let details = null;
     for (let attempt = 0; attempt < 12; attempt += 1) {
       details = await hostCall("cw.browser.evaluate", {
@@ -2028,6 +2040,7 @@ async function studyQuizPaper(session, courseId, unit, auth) {
   } catch (error) {
     return { status: "needs_human", reason: `\u5355\u5143\u6D4B\u8BD5\u6D41\u7A0B\u5931\u8D25\uFF1A${errorText(error)}` };
   } finally {
+    if (keepAlive) clearInterval(keepAlive);
     if (paperPage) await hostCall("cw.browser.close", { session, page: paperPage }).catch(() => {
     });
   }

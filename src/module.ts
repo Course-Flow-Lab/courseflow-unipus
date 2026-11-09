@@ -2216,6 +2216,7 @@ async function studyQuizPaper(session: string, courseId: string, unit: any, auth
   }
 
   let paperPage: string | null = null;
+  let keepAlive: any = null;
   try {
     const opened = await hostCall('cw.browser.open', { session, url, purpose: 'study' });
     const first = String(opened?.page ?? '');
@@ -2243,6 +2244,18 @@ async function studyQuizPaper(session: string, courseId: string, unit: any, auth
     const openedPaper = await hostCall('cw.browser.open', { session, url: examUrl, purpose: 'study' });
     paperPage = String(openedPaper?.page ?? '');
     if (!paperPage) return { status: 'needs_human', reason: '试卷页面没有打开' };
+    // Hosts reap idle browser pages (the reference framework closes pages after 90s
+    // without a call). ASR + answer generation can take minutes, so keep the page warm.
+    keepAlive = setInterval(() => {
+      if (!paperPage) return;
+      void hostCall('cw.browser.evaluate', {
+        session,
+        page: paperPage,
+        stage: 'read',
+        expression: '1',
+      }).catch(() => {});
+    }, 45_000);
+    keepAlive.unref?.();
     let details: any = null;
     for (let attempt = 0; attempt < 12; attempt += 1) {
       details = await hostCall('cw.browser.evaluate', {
@@ -2351,6 +2364,7 @@ async function studyQuizPaper(session: string, courseId: string, unit: any, auth
   } catch (error) {
     return { status: 'needs_human', reason: `单元测试流程失败：${errorText(error)}` };
   } finally {
+    if (keepAlive) clearInterval(keepAlive);
     if (paperPage) await hostCall('cw.browser.close', { session, page: paperPage }).catch(() => {});
   }
 }
