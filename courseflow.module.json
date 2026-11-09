@@ -24,6 +24,7 @@
     "network": ["unipus.cn", "*.unipus.cn"],
     "browser": true,
     "ai": true,
+    "asr": true,
     "storage": "module"
   }
 }

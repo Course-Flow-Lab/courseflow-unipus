@@ -791,11 +791,28 @@ async function transcribeAudio(session, audioUrl) {
     return "";
   }
   if (!binary?.body) return "";
-  const dir = mkdtempSync(join(tmpdir(), "courseflow-asr-"));
-  const audioPath = join(dir, "audio.mp3");
+  const base64 = String(binary.body);
+  try {
+    const result = await hostCall("cw.asr.transcribe", {
+      session,
+      audio: base64,
+      mime: "audio/mpeg"
+    });
+    const text = String(result?.text ?? "").replace(/\s+/g, " ").trim();
+    if (text) {
+      asrCache.set(url, text);
+      log("info", `asr(host) ${url.slice(-48)} -> ${text.length} chars`);
+      return text;
+    }
+  } catch (error) {
+    log("warn", `host asr unavailable: ${errorText(error)}`);
+  }
+  let dir = "";
   const scriptPath = fileURLToPath(new URL("./scripts/transcribe_audio.py", import.meta.url));
   try {
-    writeFileSync(audioPath, Buffer.from(String(binary.body), "base64"));
+    dir = mkdtempSync(join(tmpdir(), "courseflow-asr-"));
+    const audioPath = join(dir, "audio.mp3");
+    writeFileSync(audioPath, Buffer.from(base64, "base64"));
     const output = await new Promise((resolve, reject) => {
       const child = spawn(ASR_PYTHON, [scriptPath, audioPath, ASR_MODEL], {
         env: {
@@ -838,7 +855,7 @@ async function transcribeAudio(session, audioUrl) {
     log("warn", `asr failed: ${errorText(error)}`);
     return "";
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    if (dir) rmSync(dir, { recursive: true, force: true });
   }
 }
 async function collectStudyContext(session, decoded) {
@@ -1697,7 +1714,7 @@ async function openUnitTestPage() {
   const findStart = () => Array.from(document.querySelectorAll("button")).find((node) => visible(node) && /开始做题|继续答题|开始考试|继续考试/.test(node.innerText || ""));
   let button = findStart();
   const startedAt = Date.now();
-  while (!button && Date.now() - startedAt < 2e4) {
+  while (!button && Date.now() - startedAt < 12e3) {
     await sleep(500);
     button = findStart();
   }
@@ -1720,7 +1737,7 @@ async function openUnitTestPage() {
   if (!triggered) button.click();
   let src = "";
   const waited = Date.now();
-  while (Date.now() - waited < 25e3) {
+  while (Date.now() - waited < 12e3) {
     const iframe = document.querySelector("#iframe");
     src = String(iframe?.src ?? "");
     if (src) break;
@@ -1763,8 +1780,10 @@ function readUnitTestPaper() {
   return {
     url: location.href,
     title: document.title,
+    loading: location.href === "about:blank",
     ready: Boolean(document.querySelector("#submitAnswerForm, .itest-section")),
     count: questions.length,
+    body: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 300),
     questions,
     sections
   };
@@ -1846,7 +1865,7 @@ async function submitUnitTestPaper() {
   }
   let text = "";
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 2e4) {
+  while (Date.now() - startedAt < 12e3) {
     text = (document.body?.innerText || "").replace(/\s+/g, " ");
     if (/正确率|平均分|答对/.test(text)) break;
     await sleep(700);
@@ -1906,17 +1925,28 @@ async function studyQuizPaper(session, courseId, unit, auth) {
     const openedPaper = await hostCall("cw.browser.open", { session, url: examUrl, purpose: "study" });
     paperPage = String(openedPaper?.page ?? "");
     if (!paperPage) return { status: "needs_human", reason: "\u8BD5\u5377\u9875\u9762\u6CA1\u6709\u6253\u5F00" };
-    const details = await hostCall("cw.browser.evaluate", {
-      session,
-      page: paperPage,
-      stage: "save_study",
-      expression: `(${readUnitTestPaper.toString()})()`
-    });
+    let details = null;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      details = await hostCall("cw.browser.evaluate", {
+        session,
+        page: paperPage,
+        stage: "save_study",
+        expression: `(${readUnitTestPaper.toString()})()`
+      });
+      if (details?.ready && Number(details?.count) > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
     if (!details?.ready || !Number(details?.count)) {
       return {
         status: "needs_human",
         reason: "\u8BD5\u5377\u9875\u9762\u6CA1\u6709\u89E3\u6790\u51FA\u9898\u76EE",
-        evidence: { exam_url: examUrl, count: details?.count ?? 0 }
+        evidence: {
+          exam_url: examUrl,
+          page_url: details?.url ?? "",
+          title: details?.title ?? "",
+          loading: details?.loading ?? false,
+          body: String(details?.body ?? "").slice(0, 200)
+        }
       };
     }
     const answers = await solvePaperAnswers(session, details);
