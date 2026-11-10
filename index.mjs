@@ -20,23 +20,9 @@ var SETTINGS = (() => {
 var SSO_BASE = "https://sso.unipus.cn";
 var UNIPUS_BASE = typeof SETTINGS.base_url === "string" && SETTINGS.base_url.trim() ? SETTINGS.base_url.trim().replace(/\/$/, "") : "https://u.unipus.cn";
 var UCONTENT_BASE = typeof SETTINGS.content_base_url === "string" && SETTINGS.content_base_url.trim() ? SETTINGS.content_base_url.trim().replace(/\/$/, "") : "https://ucontent.unipus.cn";
-var CLASS_URL = typeof SETTINGS.class_url === "string" ? SETTINGS.class_url.trim() : "";
-var COURSE_ID = typeof SETTINGS.course_id === "string" ? SETTINGS.course_id.trim() : "";
-var SCHOOL_ID = (() => {
-  if (SETTINGS.school_id !== void 0 && SETTINGS.school_id !== null) {
-    return String(SETTINGS.school_id);
-  }
-  const match = CLASS_URL.match(/[?&]school_id=(\d+)/);
-  return match ? match[1] : "";
-})();
-var CLASS_ID = (() => {
-  const match = CLASS_URL.match(/[?&]classId=(\d+)/);
-  return match ? match[1] : "";
-})();
-var DB_COURSE_ID = (() => {
-  const match = CLASS_URL.match(/[?&]courseId=(\d+)/);
-  return match ? match[1] : "";
-})();
+var COURSE_LIST_PATH = "/user/student/index";
+var COURSE_CATALOG_PATH = "/user/student/mycourse/courseCatalog";
+var CATALOG_NAMESPACE = "catalog";
 var BROWSER_STUDY = SETTINGS.browser_study !== false;
 var UNIT_TEST_ENABLED = SETTINGS.enable_unit_test === true;
 var UNIT_TEST_DRY_RUN = SETTINGS.unit_test_dry_run === true;
@@ -175,14 +161,14 @@ function authBegin(params) {
 async function kickOtherSession(session) {
   try {
     log("warn", "single-session conflict, logging out the other session");
-    await follow(session, `${UNIPUS_BASE}/logout?school_id=${encodeURIComponent(SCHOOL_ID)}&repeatLogin=1`, 6);
+    await follow(session, `${UNIPUS_BASE}/logout?school_id=&repeatLogin=1`, 6);
     await follow(session, `${UNIPUS_BASE}/user/comm/login?school_id=`, 4);
   } catch (error) {
     log("warn", `logout other session failed: ${errorText(error)}`);
   }
 }
 async function casLogin(session, username, password) {
-  const service = `${UNIPUS_BASE}/user/student?school_id=${encodeURIComponent(SCHOOL_ID)}`;
+  const service = `${UNIPUS_BASE}/user/comm/login?school_id=`;
   const loginPage = `${SSO_BASE}/sso/login?service=${encodeURIComponent(service)}`;
   const fetcher = hostFetchFor(session);
   await fetcher(loginPage, {
@@ -224,7 +210,6 @@ async function casLogin(session, username, password) {
   return { service, ticket, openId, fetcher };
 }
 async function liveLogin(session, username, password) {
-  if (!SCHOOL_ID) throw new Error("\u6A21\u5757\u8BBE\u7F6E\u7F3A\u5C11 school_id\uFF08\u6216\u5728 class_url \u4E2D\u5E26\u4E0A\uFF09");
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (attempt > 0) await kickOtherSession(session);
@@ -253,24 +238,11 @@ async function liveLogin(session, username, password) {
       lastError = { code: "platform_session_conflict", message: "getToken \u672A\u8FD4\u56DE token" };
       continue;
     }
-    if (CLASS_ID && DB_COURSE_ID) {
-      try {
-        await fetcher(
-          `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
-          {
-            headers: {
-              ...BROWSER_HEADERS,
-              accept: "text/html, */*; q=0.01",
-              referer: service,
-              "x-requested-with": "XMLHttpRequest"
-            }
-          }
-        );
-      } catch (error) {
-        log("warn", `automaticJoinClass failed: ${errorText(error)}`);
-      }
+    if (!resolvedOpenId) {
+      lastError = { code: "platform_protocol_changed", message: "getToken \u672A\u8FD4\u56DE openId" };
+      continue;
     }
-    return { token: String(token), openId: String(resolvedOpenId ?? ""), displayName: username };
+    return { token: String(token), openId: String(resolvedOpenId), displayName: username };
   }
   throw lastError ?? { code: "platform_session_conflict", message: "\u767B\u5F55\u5931\u8D25" };
 }
@@ -293,7 +265,6 @@ async function authSubmit(params) {
       value: {
         token: identity.token,
         open_id: identity.openId,
-        school_id: SCHOOL_ID,
         connected_at: Date.now()
       }
     });
@@ -345,12 +316,149 @@ async function readAuth(session) {
   if (!value?.token) throw { code: "platform_login_expired", message: "\u8BF7\u5148\u8FDE\u63A5 U\u6821\u56ED\u666E\u901A\u7248" };
   return value;
 }
-function courseFromCatalog(html) {
-  const idMatch = html.match(/var\s+course_id\s*=\s*"([^"]+)"/);
-  const titleMatch = html.match(/<h3>([^<]+)<\/h3>/) ?? html.match(/<title>([^<]*)<\/title>/) ?? [];
-  if (!idMatch) throw new Error("\u8BFE\u7A0B\u76EE\u5F55\u9875\u91CC\u6CA1\u6709\u627E\u5230 course_id");
-  const name = String(titleMatch[1] ?? "U\u6821\u56ED\u8BFE\u7A0B").trim() || "U\u6821\u56ED\u8BFE\u7A0B";
-  return { id: idMatch[1], name };
+function decodeHtml(value) {
+  return String(value ?? "").replace(/&#x([0-9a-f]+);/gi, (_match, hex) => {
+    try {
+      return String.fromCodePoint(parseInt(hex, 16));
+    } catch {
+      return "";
+    }
+  }).replace(/&#(\d+);/g, (_match, number) => {
+    try {
+      return String.fromCodePoint(Number(number));
+    } catch {
+      return "";
+    }
+  }).replace(/&(nbsp|amp|lt|gt|quot|apos|#39);/gi, (_match, name) => {
+    const key = String(name).toLowerCase();
+    return key === "nbsp" ? " " : key === "amp" ? "&" : key === "lt" ? "<" : key === "gt" ? ">" : key === "quot" ? '"' : "'";
+  });
+}
+function stripTags(value) {
+  return decodeHtml(String(value ?? "").replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+}
+function parseCourseCards(html) {
+  const cards = [];
+  const seen = /* @__PURE__ */ new Set();
+  const body = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
+  const opens = [...body.matchAll(/<div\b[^>]*\bclass\s*=\s*(["'])([^"']*)\1[^>]*>/gi)].filter((match) => /\bmy_course_item\b/.test(match[2] ?? ""));
+  for (let index = 0; index < opens.length; index += 1) {
+    const start = opens[index].index ?? 0;
+    const end = index + 1 < opens.length ? opens[index + 1].index ?? body.length : body.length;
+    const chunk = body.slice(start, end);
+    if (!/\bite\b/.test(opens[index][2] ?? "") && !/\bhideurl\b/i.test(chunk)) continue;
+    let raw = "";
+    const hide = chunk.match(
+      /<([a-zA-Z][\w-]*)\b[^>]*\bclass\s*=\s*(["'])[^"']*\bhideurl\b[^"']*\2[^>]*>([\s\S]*?)<\/\1>/i
+    );
+    if (hide) {
+      const openTag = hide[0].slice(0, hide[0].indexOf(">") + 1);
+      const href = openTag.match(/\bhref\s*=\s*(["'])(.*?)\1/i);
+      raw = stripTags(hide[3]) || decodeHtml(href?.[2] ?? "");
+    }
+    if (!raw) {
+      const href = chunk.match(
+        /\bhref\s*=\s*(["'])([^"']*\/user\/student\/mycourse\/courseCatalog[^"']*)\1/i
+      );
+      raw = decodeHtml(href?.[2] ?? "");
+    }
+    if (!raw) continue;
+    let url;
+    try {
+      url = new URL(raw, UNIPUS_BASE);
+    } catch {
+      continue;
+    }
+    const host = new URL(UNIPUS_BASE).hostname;
+    if (url.hostname !== host || url.pathname !== COURSE_CATALOG_PATH) continue;
+    const query = url.searchParams;
+    const apiCourseId = String(query.get("courseId") ?? "").trim();
+    const classId = String(query.get("classId") ?? "").trim();
+    const schoolId = String(query.get("school_id") ?? "").trim();
+    const eccId = String(query.get("eccId") ?? "").trim();
+    const courseType = String(query.get("coursetype") ?? "").trim();
+    if (!/^\d+$/.test(apiCourseId) || !/^\d+$/.test(classId) || classId === "0" || !/^\d+$/.test(eccId) || !/^\d*$/.test(courseType) || schoolId !== "" && !/^\d+$/.test(schoolId)) continue;
+    const nameElement = chunk.match(
+      /<([a-zA-Z][\w-]*)\b[^>]*\bclass\s*=\s*(["'])[^"']*\bmy_course_name\b[^"']*\2[^>]*>([\s\S]*?)<\/\1>/i
+    );
+    const title = nameElement ? decodeHtml(nameElement[0].match(/\btitle\s*=\s*(["'])(.*?)\1/i)?.[2] ?? stripTags(nameElement[3])) : "";
+    const name = title.trim() || `U\u6821\u56ED\u8BFE\u7A0B ${apiCourseId}`;
+    const key = `${apiCourseId}\0${classId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    cards.push({
+      api_course_id: apiCourseId,
+      class_id: classId,
+      school_id: schoolId,
+      ecc_id: eccId,
+      course_type: courseType,
+      name,
+      catalog_url: `${UNIPUS_BASE}${COURSE_CATALOG_PATH}?courseId=${encodeURIComponent(apiCourseId)}&school_id=${encodeURIComponent(schoolId)}&eccId=${encodeURIComponent(eccId)}&classId=${encodeURIComponent(classId)}&coursetype=${encodeURIComponent(courseType)}`
+    });
+  }
+  return cards;
+}
+function parseCourseShell(html) {
+  const read = (names) => {
+    for (const name of names) {
+      const values = /* @__PURE__ */ new Set();
+      const pattern = new RegExp(`\\bvar\\s+${name}\\s*=\\s*(['"])([^'"]*)\\1`, "g");
+      for (const match of html.matchAll(pattern)) {
+        if (match[2]) values.add(match[2]);
+      }
+      if (values.size === 1) return [...values][0];
+      if (values.size > 1) return "";
+    }
+    return "";
+  };
+  return {
+    content_id: read(["course_id", "courseId"]),
+    version: read(["version"]),
+    db_course_id: read(["dbCourseId", "db_course_id", "db_courseid"]),
+    class_id: read(["classId", "class_id"])
+  };
+}
+function isLoginHtml(html) {
+  return /<title[^>]*>\s*(?:SSO)?登录\s*<\/title>/i.test(html) || /\bid\s*=\s*["']pw-form["']/i.test(html) || /<form[^>]+action\s*=\s*["'][^"']*(?:sso\.unipus\.cn|\/user\/comm\/login)/i.test(html) || /location(?:\.href)?\s*=\s*["'][^"']*(?:sso\.unipus\.cn|\/user\/comm\/login)/i.test(html);
+}
+function accountKey(openId) {
+  return openId || "default";
+}
+function courseStateKey(openId, apiCourseId, classId) {
+  return `course:${accountKey(openId)}:${apiCourseId}:${classId}`;
+}
+async function readCourseCards(session, openId) {
+  const stored = await hostCall("cw.state", {
+    session,
+    namespace: CATALOG_NAMESPACE,
+    key: `courses:${accountKey(openId)}`
+  });
+  return Array.isArray(stored?.value) ? stored.value : null;
+}
+async function fetchCourseList(session, auth) {
+  const result = await follow(session, `${UNIPUS_BASE}${COURSE_LIST_PATH}`, 8);
+  const html = result.body;
+  if (isLoginHtml(html)) {
+    throw { code: "platform_login_expired", message: "U\u6821\u56ED\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u8FDE\u63A5" };
+  }
+  if (!result.response.ok && !html.trim()) {
+    throw { code: "platform_unavailable", message: `\u8BFE\u7A0B\u5217\u8868 HTTP ${result.response.status}` };
+  }
+  const cards = parseCourseCards(html);
+  if (cards.length === 0) {
+    log("warn", "\u8BFE\u7A0B\u5217\u8868\u6CA1\u6709\u89E3\u6790\u5230\u8BFE\u7A0B\uFF0C\u8BF7\u68C0\u67E5\u8D26\u53F7\u662F\u5426\u5DF2\u52A0\u5165\u73ED\u7EA7\u6216\u8BFE\u7A0B\u5217\u8868\u9875\u7ED3\u6784");
+  }
+  if (!result.response.ok && cards.length === 0) {
+    throw { code: "platform_unavailable", message: `\u8BFE\u7A0B\u5217\u8868 HTTP ${result.response.status}` };
+  }
+  await hostCall("cw.state", {
+    session,
+    namespace: CATALOG_NAMESPACE,
+    key: `courses:${accountKey(String(auth?.open_id ?? ""))}`,
+    value: cards
+  });
+  log("info", `catalog.courses openId=${auth?.open_id ?? ""} courses=${cards.length}`);
+  return cards;
 }
 async function ensureContentSession(session, courseId) {
   const next = encodeURIComponent(`/courses/${courseId}/menus`);
@@ -360,40 +468,108 @@ async function ensureContentSession(session, courseId) {
     log("warn", `ucontent session failed: ${errorText(error)}`);
   }
 }
-async function loadCourse(session) {
-  if (COURSE_ID) return { id: COURSE_ID, name: "U\u6821\u56ED\u8BFE\u7A0B" };
-  if (!CLASS_URL) throw { code: "invalid_params", message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E class_url" };
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
-  const response = await fetcher(CLASS_URL, {
-    headers: { ...BROWSER_HEADERS, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", referer: CLASS_URL }
-  });
-  if (!response.ok) {
-    throw { code: "platform_unavailable", message: `\u8BFE\u7A0B\u76EE\u5F55\u9875 HTTP ${response.status}` };
-  }
-  void auth;
-  return courseFromCatalog(await response.text());
-}
 async function catalogCourses(params) {
-  if (!CLASS_URL && !COURSE_ID) {
-    throw { code: "invalid_params", message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E class_url \u6216 course_id" };
-  }
-  await readAuth(String(params.session ?? ""));
-  const course = await loadCourse(String(params.session ?? ""));
+  const session = String(params.session ?? "");
+  const auth = await readAuth(session);
+  const cards = await fetchCourseList(session, auth);
   return {
-    courses: [
-      {
-        id: course.id,
-        recruit_id: course.id,
-        name: course.name,
-        kind: "shared",
-        kind_label: "\u5171\u4EAB\u8BFE",
-        family: "shared",
-        progress: null,
-        outline_available: true
-      }
-    ]
+    courses: cards.map((card) => ({
+      id: card.api_course_id,
+      recruit_id: card.class_id,
+      name: card.name,
+      kind: "shared",
+      kind_label: "U\u6821\u56ED\u8BFE\u7A0B",
+      family: "shared",
+      progress: null,
+      outline_available: true
+    }))
   };
+}
+async function resolveCourse(session, publicCourse, auth) {
+  const openId = String(auth?.open_id ?? "");
+  const wantedId = String(publicCourse?.id ?? "").trim();
+  const wantedClass = String(publicCourse?.recruit_id ?? "").trim();
+  let cards = await readCourseCards(session, openId);
+  const findCard = (values) => {
+    const matches = values.filter(
+      (card2) => (!wantedId || card2.api_course_id === wantedId) && (!wantedClass || card2.class_id === wantedClass)
+    );
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw { code: "invalid_params", message: "\u8BE5\u8BFE\u7A0B\u6709\u591A\u4E2A\u73ED\u7EA7\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u8BFE\u7A0B\u548C\u73ED\u7EA7" };
+    }
+    return null;
+  };
+  let card = null;
+  if (wantedId || wantedClass) {
+    card = findCard(cards ?? []);
+    if (!card) {
+      cards = await fetchCourseList(session, auth);
+      card = findCard(cards);
+    }
+    if (!card) throw { code: "not_found", message: "\u5F53\u524D\u8D26\u53F7\u4E0B\u627E\u4E0D\u5230\u8FD9\u95E8\u8BFE\u7A0B\uFF0C\u8BF7\u5237\u65B0\u8BFE\u7A0B\u5217\u8868" };
+  } else {
+    if (!cards) cards = await fetchCourseList(session, auth);
+    const selected = await hostCall("cw.state", {
+      session,
+      namespace: CATALOG_NAMESPACE,
+      key: `selected:${accountKey(openId)}`
+    });
+    const selectedId = String(selected?.value?.id ?? "");
+    const selectedClass = String(selected?.value?.recruit_id ?? "");
+    if (selectedId || selectedClass) {
+      const found = (cards ?? []).find(
+        (value) => (!selectedId || value.api_course_id === selectedId) && (!selectedClass || value.class_id === selectedClass)
+      );
+      if (found) card = found;
+    }
+    if (!card && (cards ?? []).length === 1) card = cards[0];
+    if (!card) throw { code: "invalid_params", message: "\u8BF7\u5148\u5728\u8BFE\u7A0B\u5217\u8868\u91CC\u9009\u62E9\u4E00\u95E8\u8BFE\u7A0B" };
+  }
+  const key = courseStateKey(openId, card.api_course_id, card.class_id);
+  const stored = await hostCall("cw.state", { session, namespace: CATALOG_NAMESPACE, key });
+  const cached = stored?.value;
+  let context = cached?.content_id && String(cached.open_id ?? "") === openId && String(cached.api_course_id ?? "") === card.api_course_id && String(cached.class_id ?? "") === card.class_id && String(cached.ecc_id ?? "") === card.ecc_id && String(cached.course_type ?? "") === card.course_type ? {
+    ...cached,
+    ...card,
+    content_id: String(cached.content_id),
+    version: String(cached.version || "default"),
+    open_id: openId
+  } : null;
+  if (!context) {
+    const page = await follow(session, card.catalog_url, 6);
+    if (isLoginHtml(page.body)) {
+      throw { code: "platform_login_expired", message: "U\u6821\u56ED\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u8FDE\u63A5" };
+    }
+    if (!page.response.ok) {
+      throw { code: "platform_unavailable", message: `\u8BFE\u7A0B\u76EE\u5F55\u9875 HTTP ${page.response.status}` };
+    }
+    const shell = parseCourseShell(page.body);
+    if (!shell.content_id) {
+      throw { code: "platform_protocol_changed", message: "\u8BFE\u7A0B\u76EE\u5F55\u9875\u91CC\u6CA1\u6709\u627E\u5230 course_id" };
+    }
+    if (shell.db_course_id && shell.db_course_id !== card.api_course_id) {
+      throw { code: "platform_protocol_changed", message: "\u8BFE\u7A0B\u76EE\u5F55\u9875\u4E0E\u8BFE\u7A0B\u5217\u8868\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5237\u65B0\u8BFE\u7A0B\u5217\u8868" };
+    }
+    if (shell.class_id && shell.class_id !== card.class_id) {
+      throw { code: "platform_protocol_changed", message: "\u8BFE\u7A0B\u76EE\u5F55\u9875\u4E0E\u6240\u9009\u73ED\u7EA7\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9" };
+    }
+    context = {
+      ...card,
+      content_id: shell.content_id,
+      version: shell.version || "default",
+      open_id: openId
+    };
+    await hostCall("cw.state", { session, namespace: CATALOG_NAMESPACE, key, value: context });
+    log("info", `course resolved ${card.api_course_id}/${card.class_id} -> ${context.content_id}`);
+  }
+  await hostCall("cw.state", {
+    session,
+    namespace: CATALOG_NAMESPACE,
+    key: `selected:${accountKey(openId)}`,
+    value: { id: card.api_course_id, recruit_id: card.class_id, at: Date.now() }
+  });
+  return context;
 }
 async function fetchText(session, url, headers, stage = "read") {
   const response = await hostFetchFor(session, stage)(url, {
@@ -411,11 +587,8 @@ function annotatorHeaders(auth) {
 async function catalogUnits(params) {
   const session = String(params.session ?? "");
   const auth = await readAuth(session);
-  const course = await loadCourse(session);
-  const courseId = course.id;
-  if (params.course?.id && params.course.id !== courseId) {
-    throw { code: "not_found", message: "\u8BFE\u7A0B\u4E0D\u5B58\u5728" };
-  }
+  const course = await resolveCourse(session, params.course, auth);
+  const courseId = course.content_id;
   await ensureContentSession(session, courseId);
   const treeResult = await fetchText(
     session,
@@ -1089,10 +1262,11 @@ function isSinglePageTask(questionsList) {
   );
   return pages.size <= 1;
 }
-function coursewareUrl(courseId, groupId, questionsList) {
+function coursewareUrl(courseId, groupId, questionsList, course) {
   const parentPath = questionsList?.[0]?.path?.[1] ?? [];
   const coursewarePath = [...parentPath, groupId];
-  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}#/${courseId}/courseware/${coursewarePath.join("/")}/p_1`;
+  const school = course.school_id ? `&schId=${encodeURIComponent(course.school_id)}` : "";
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${encodeURIComponent(course.class_id)}&appid=5${school}#/${courseId}/courseware/${coursewarePath.join("/")}/p_1`;
 }
 async function browserStudy(session, courseId, groupId, url, mode, values, auth, minScorePct) {
   let opened = null;
@@ -1138,7 +1312,8 @@ async function browserStudy(session, courseId, groupId, url, mode, values, auth,
     evidence: { browser_result: result, state: pass, score }
   };
 }
-async function studyFillblankBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
+async function studyFillblankBrowser(session, course, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
+  const courseId = course.content_id;
   let answers = scriptAnswers(decoded);
   if (answers.length === 0) {
     const context = await collectStudyContext(session, decoded);
@@ -1156,7 +1331,7 @@ async function studyFillblankBrowser(session, courseId, groupId, decoded, questi
     session,
     courseId,
     groupId,
-    coursewareUrl(courseId, groupId, questionsList),
+    coursewareUrl(courseId, groupId, questionsList, course),
     "fill",
     answers,
     auth,
@@ -1198,7 +1373,8 @@ function choiceCaptions(group, solved) {
     return matchChoiceCaption(options, solved[String(index)] ?? []);
   });
 }
-async function studyChoiceBrowser(session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
+async function studyChoiceBrowser(session, course, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
+  const courseId = course.content_id;
   const context = await collectStudyContext(session, decoded);
   const solved = await solveChoiceQuestions(session, questionGroup, context);
   if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
@@ -1207,7 +1383,7 @@ async function studyChoiceBrowser(session, courseId, groupId, decoded, questionG
     session,
     courseId,
     groupId,
-    coursewareUrl(courseId, groupId, questionsList),
+    coursewareUrl(courseId, groupId, questionsList, course),
     "choice",
     captions,
     auth,
@@ -1480,10 +1656,11 @@ async function studyShortAnswerApi(session, courseId, groupId, decoded, question
     evidence: { state: submitState, score_pct: scorePct }
   };
 }
-function paperCoursewareUrl(courseId, unit) {
+function paperCoursewareUrl(course, unit) {
   const path = Array.isArray(unit?.courseware_path) ? unit.courseware_path.map((item) => String(item ?? "")).filter(Boolean) : [];
   if (path.length < 2) return null;
-  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}&appName=3001#/${courseId}/courseware/${path.join("/")}/p_1`;
+  const school = course.school_id ? `&schId=${encodeURIComponent(course.school_id)}` : "";
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${encodeURIComponent(course.class_id)}&appid=5${school}&appName=3001#/${course.content_id}/courseware/${path.join("/")}/p_1`;
 }
 function stripOptionPrefix(value) {
   return String(value ?? "").replace(/^[A-Da-d][.、)]\s*/, "").trim();
@@ -1884,7 +2061,8 @@ async function paperProgress(session, courseId, groupId, auth) {
     return null;
   }
 }
-async function studyQuizPaper(session, courseId, unit, auth) {
+async function studyQuizPaper(session, course, unit, auth) {
+  const courseId = course.content_id;
   const groupId = String(unit.id ?? "").split("::")[0];
   if (!UNIT_TEST_ENABLED) {
     return {
@@ -1893,7 +2071,7 @@ async function studyQuizPaper(session, courseId, unit, auth) {
       evidence: { exam: unit.exam ?? null }
     };
   }
-  const url = paperCoursewareUrl(courseId, unit);
+  const url = paperCoursewareUrl(course, unit);
   if (!url) {
     return { status: "needs_human", reason: "\u5355\u5143\u6D4B\u8BD5\u7F3A\u5C11\u8BFE\u4EF6\u8DEF\u5F84", evidence: { exam: unit.exam ?? null } };
   }
@@ -2045,10 +2223,11 @@ async function studyQuizPaper(session, courseId, unit, auth) {
     });
   }
 }
-async function studyTask(session, courseId, unit, auth) {
+async function studyTask(session, course, unit, auth) {
+  const courseId = course.content_id;
   const groupId = String(unit.id ?? "").split("::")[0];
   if (String(unit.selectable_note ?? "") === "quiz-paper-link" || unit.exam) {
-    return studyQuizPaper(session, courseId, unit, auth);
+    return studyQuizPaper(session, course, unit, auth);
   }
   let minScorePct = 0;
   let progressData = null;
@@ -2134,7 +2313,7 @@ async function studyTask(session, courseId, unit, auth) {
     if (BROWSER_STUDY) {
       const browserResult = await studyFillblankBrowser(
         session,
-        courseId,
+        course,
         groupId,
         decoded,
         questionGroup,
@@ -2181,7 +2360,7 @@ async function studyTask(session, courseId, unit, auth) {
     if (BROWSER_STUDY) {
       const browserResult = await studyChoiceBrowser(
         session,
-        courseId,
+        course,
         groupId,
         decoded,
         questionGroup,
@@ -2256,11 +2435,11 @@ async function studyStep(params) {
   const rawId = String(unit.id ?? "");
   if (!rawId) throw { code: "invalid_params", message: "\u7F3A\u5C11\u5355\u5143 id" };
   const auth = await readAuth(session);
-  const course = await loadCourse(session);
+  const course = await resolveCourse(session, params.course, auth);
   if (String(unit.kind) === "document") {
-    return studyTask(session, course.id, unit, auth);
+    return studyTask(session, course, unit, auth);
   }
-  return studyLeaf(session, course.id, unit, auth);
+  return studyLeaf(session, course.content_id, unit, auth);
 }
 async function dispatch(method, params) {
   switch (method) {

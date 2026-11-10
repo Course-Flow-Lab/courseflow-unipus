@@ -28,25 +28,10 @@ const UCONTENT_BASE =
   typeof SETTINGS.content_base_url === 'string' && SETTINGS.content_base_url.trim()
     ? SETTINGS.content_base_url.trim().replace(/\/$/, '')
     : 'https://ucontent.unipus.cn';
-const CLASS_URL =
-  typeof SETTINGS.class_url === 'string' ? SETTINGS.class_url.trim() : '';
-const COURSE_ID =
-  typeof SETTINGS.course_id === 'string' ? SETTINGS.course_id.trim() : '';
-const SCHOOL_ID = (() => {
-  if (SETTINGS.school_id !== undefined && SETTINGS.school_id !== null) {
-    return String(SETTINGS.school_id);
-  }
-  const match = CLASS_URL.match(/[?&]school_id=(\d+)/);
-  return match ? match[1] : '';
-})();
-const CLASS_ID = (() => {
-  const match = CLASS_URL.match(/[?&]classId=(\d+)/);
-  return match ? match[1] : '';
-})();
-const DB_COURSE_ID = (() => {
-  const match = CLASS_URL.match(/[?&]courseId=(\d+)/);
-  return match ? match[1] : '';
-})();
+const COURSE_LIST_PATH = '/user/student/index';
+const COURSE_CATALOG_PATH = '/user/student/mycourse/courseCatalog';
+const CATALOG_NAMESPACE = 'catalog';
+
 const BROWSER_STUDY = SETTINGS.browser_study !== false;
 const UNIT_TEST_ENABLED = SETTINGS.enable_unit_test === true;
 const UNIT_TEST_DRY_RUN = SETTINGS.unit_test_dry_run === true;
@@ -218,7 +203,7 @@ function authBegin(params: any) {
 async function kickOtherSession(session: string): Promise<void> {
   try {
     log('warn', 'single-session conflict, logging out the other session');
-    await follow(session, `${UNIPUS_BASE}/logout?school_id=${encodeURIComponent(SCHOOL_ID)}&repeatLogin=1`, 6);
+    await follow(session, `${UNIPUS_BASE}/logout?school_id=&repeatLogin=1`, 6);
     await follow(session, `${UNIPUS_BASE}/user/comm/login?school_id=`, 4);
   } catch (error) {
     log('warn', `logout other session failed: ${errorText(error)}`);
@@ -226,7 +211,9 @@ async function kickOtherSession(session: string): Promise<void> {
 }
 
 async function casLogin(session: string, username: string, password: string) {
-  const service = `${UNIPUS_BASE}/user/student?school_id=${encodeURIComponent(SCHOOL_ID)}`;
+  // U校园 classic uses a single SSO account; the school is resolved later from
+  // the user's own course list, so no school_id is required in module settings.
+  const service = `${UNIPUS_BASE}/user/comm/login?school_id=`;
   const loginPage = `${SSO_BASE}/sso/login?service=${encodeURIComponent(service)}`;
   const fetcher = hostFetchFor(session);
 
@@ -271,7 +258,6 @@ async function casLogin(session: string, username: string, password: string) {
 }
 
 async function liveLogin(session: string, username: string, password: string) {
-  if (!SCHOOL_ID) throw new Error('模块设置缺少 school_id（或在 class_url 中带上）');
   let lastError: any = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (attempt > 0) await kickOtherSession(session);
@@ -301,24 +287,11 @@ async function liveLogin(session: string, username: string, password: string) {
       lastError = { code: 'platform_session_conflict', message: 'getToken 未返回 token' };
       continue;
     }
-    if (CLASS_ID && DB_COURSE_ID) {
-      try {
-        await fetcher(
-          `${UNIPUS_BASE}/user/student/mycourse/automaticJoinClass?classId=${CLASS_ID}&now=${Date.now()}&courseId=${DB_COURSE_ID}`,
-          {
-            headers: {
-              ...BROWSER_HEADERS,
-              accept: 'text/html, */*; q=0.01',
-              referer: service,
-              'x-requested-with': 'XMLHttpRequest',
-            },
-          },
-        );
-      } catch (error) {
-        log('warn', `automaticJoinClass failed: ${errorText(error)}`);
-      }
+    if (!resolvedOpenId) {
+      lastError = { code: 'platform_protocol_changed', message: 'getToken 未返回 openId' };
+      continue;
     }
-    return { token: String(token), openId: String(resolvedOpenId ?? ''), displayName: username };
+    return { token: String(token), openId: String(resolvedOpenId), displayName: username };
   }
   throw lastError ?? { code: 'platform_session_conflict', message: '登录失败' };
 }
@@ -343,7 +316,6 @@ async function authSubmit(params: any) {
       value: {
         token: identity.token,
         open_id: identity.openId,
-        school_id: SCHOOL_ID,
         connected_at: Date.now(),
       },
     });
@@ -403,15 +375,202 @@ async function readAuth(session: string): Promise<any> {
 
 // ------------------------------------------------------------------ course
 
-function courseFromCatalog(html: string): { id: string; name: string } {
-  const idMatch = html.match(/var\s+course_id\s*=\s*"([^"]+)"/);
-  const titleMatch =
-    html.match(/<h3>([^<]+)<\/h3>/) ??
-    html.match(/<title>([^<]*)<\/title>/) ??
-    [];
-  if (!idMatch) throw new Error('课程目录页里没有找到 course_id');
-  const name = String(titleMatch[1] ?? 'U校园课程').trim() || 'U校园课程';
-  return { id: idMatch[1], name };
+function decodeHtml(value: any): string {
+  return String(value ?? '')
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex) => {
+      try {
+        return String.fromCodePoint(parseInt(hex, 16));
+      } catch {
+        return '';
+      }
+    })
+    .replace(/&#(\d+);/g, (_match, number) => {
+      try {
+        return String.fromCodePoint(Number(number));
+      } catch {
+        return '';
+      }
+    })
+    .replace(/&(nbsp|amp|lt|gt|quot|apos|#39);/gi, (_match, name) => {
+      const key = String(name).toLowerCase();
+      return key === 'nbsp' ? ' '
+        : key === 'amp' ? '&'
+        : key === 'lt' ? '<'
+        : key === 'gt' ? '>'
+        : key === 'quot' ? '"'
+        : "'";
+    });
+}
+
+function stripTags(value: any): string {
+  return decodeHtml(String(value ?? '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+type CourseCard = {
+  api_course_id: string;
+  class_id: string;
+  school_id: string;
+  ecc_id: string;
+  course_type: string;
+  name: string;
+  catalog_url: string;
+};
+
+type CourseContext = CourseCard & {
+  content_id: string;
+  version: string;
+  open_id: string;
+};
+
+function parseCourseCards(html: string): CourseCard[] {
+  const cards: CourseCard[] = [];
+  const seen = new Set<string>();
+  const body = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '');
+  const opens = [...body.matchAll(/<div\b[^>]*\bclass\s*=\s*(["'])([^"']*)\1[^>]*>/gi)]
+    .filter((match) => /\bmy_course_item\b/.test(match[2] ?? ''));
+  for (let index = 0; index < opens.length; index += 1) {
+    const start = opens[index].index ?? 0;
+    const end = index + 1 < opens.length ? (opens[index + 1].index ?? body.length) : body.length;
+    const chunk = body.slice(start, end);
+    if (!/\bite\b/.test(opens[index][2] ?? '') && !/\bhideurl\b/i.test(chunk)) continue;
+
+    let raw = '';
+    const hide = chunk.match(
+      /<([a-zA-Z][\w-]*)\b[^>]*\bclass\s*=\s*(["'])[^"']*\bhideurl\b[^"']*\2[^>]*>([\s\S]*?)<\/\1>/i,
+    );
+    if (hide) {
+      const openTag = hide[0].slice(0, hide[0].indexOf('>') + 1);
+      const href = openTag.match(/\bhref\s*=\s*(["'])(.*?)\1/i);
+      raw = stripTags(hide[3]) || decodeHtml(href?.[2] ?? '');
+    }
+    if (!raw) {
+      const href = chunk.match(
+        /\bhref\s*=\s*(["'])([^"']*\/user\/student\/mycourse\/courseCatalog[^"']*)\1/i,
+      );
+      raw = decodeHtml(href?.[2] ?? '');
+    }
+    if (!raw) continue;
+
+    let url: URL;
+    try {
+      url = new URL(raw, UNIPUS_BASE);
+    } catch {
+      continue;
+    }
+    const host = new URL(UNIPUS_BASE).hostname;
+    if (url.hostname !== host || url.pathname !== COURSE_CATALOG_PATH) continue;
+    const query = url.searchParams;
+    const apiCourseId = String(query.get('courseId') ?? '').trim();
+    const classId = String(query.get('classId') ?? '').trim();
+    const schoolId = String(query.get('school_id') ?? '').trim();
+    const eccId = String(query.get('eccId') ?? '').trim();
+    const courseType = String(query.get('coursetype') ?? '').trim();
+    if (!/^\d+$/.test(apiCourseId) || !/^\d+$/.test(classId) || classId === '0'
+      || !/^\d+$/.test(eccId) || !/^\d*$/.test(courseType)
+      || (schoolId !== '' && !/^\d+$/.test(schoolId))) continue;
+
+    const nameElement = chunk.match(
+      /<([a-zA-Z][\w-]*)\b[^>]*\bclass\s*=\s*(["'])[^"']*\bmy_course_name\b[^"']*\2[^>]*>([\s\S]*?)<\/\1>/i,
+    );
+    const title = nameElement
+      ? decodeHtml(nameElement[0].match(/\btitle\s*=\s*(["'])(.*?)\1/i)?.[2] ?? stripTags(nameElement[3]))
+      : '';
+    const name = title.trim() || `U校园课程 ${apiCourseId}`;
+    const key = `${apiCourseId}\u0000${classId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    cards.push({
+      api_course_id: apiCourseId,
+      class_id: classId,
+      school_id: schoolId,
+      ecc_id: eccId,
+      course_type: courseType,
+      name,
+      catalog_url:
+        `${UNIPUS_BASE}${COURSE_CATALOG_PATH}?courseId=${encodeURIComponent(apiCourseId)}`
+        + `&school_id=${encodeURIComponent(schoolId)}&eccId=${encodeURIComponent(eccId)}`
+        + `&classId=${encodeURIComponent(classId)}&coursetype=${encodeURIComponent(courseType)}`,
+    });
+  }
+  return cards;
+}
+
+function parseCourseShell(html: string): {
+  content_id: string;
+  version: string;
+  db_course_id: string;
+  class_id: string;
+} {
+  const read = (names: string[]) => {
+    for (const name of names) {
+      const values = new Set<string>();
+      const pattern = new RegExp(`\\bvar\\s+${name}\\s*=\\s*(['"])([^'"]*)\\1`, 'g');
+      for (const match of html.matchAll(pattern)) {
+        if (match[2]) values.add(match[2]);
+      }
+      if (values.size === 1) return [...values][0];
+      if (values.size > 1) return '';
+    }
+    return '';
+  };
+  return {
+    content_id: read(['course_id', 'courseId']),
+    version: read(['version']),
+    db_course_id: read(['dbCourseId', 'db_course_id', 'db_courseid']),
+    class_id: read(['classId', 'class_id']),
+  };
+}
+
+function isLoginHtml(html: string): boolean {
+  return /<title[^>]*>\s*(?:SSO)?登录\s*<\/title>/i.test(html)
+    || /\bid\s*=\s*["']pw-form["']/i.test(html)
+    || /<form[^>]+action\s*=\s*["'][^"']*(?:sso\.unipus\.cn|\/user\/comm\/login)/i.test(html)
+    || /location(?:\.href)?\s*=\s*["'][^"']*(?:sso\.unipus\.cn|\/user\/comm\/login)/i.test(html);
+}
+
+function accountKey(openId: string): string {
+  return openId || 'default';
+}
+
+function courseStateKey(openId: string, apiCourseId: string, classId: string): string {
+  return `course:${accountKey(openId)}:${apiCourseId}:${classId}`;
+}
+
+async function readCourseCards(session: string, openId: string): Promise<CourseCard[] | null> {
+  const stored = await hostCall('cw.state', {
+    session,
+    namespace: CATALOG_NAMESPACE,
+    key: `courses:${accountKey(openId)}`,
+  });
+  return Array.isArray(stored?.value) ? stored.value : null;
+}
+
+async function fetchCourseList(session: string, auth: any): Promise<CourseCard[]> {
+  const result = await follow(session, `${UNIPUS_BASE}${COURSE_LIST_PATH}`, 8);
+  const html = result.body;
+  if (isLoginHtml(html)) {
+    throw { code: 'platform_login_expired', message: 'U校园登录已过期，请重新连接' };
+  }
+  if (!result.response.ok && !html.trim()) {
+    throw { code: 'platform_unavailable', message: `课程列表 HTTP ${result.response.status}` };
+  }
+  const cards = parseCourseCards(html);
+  if (cards.length === 0) {
+    log('warn', '课程列表没有解析到课程，请检查账号是否已加入班级或课程列表页结构');
+  }
+  if (!result.response.ok && cards.length === 0) {
+    throw { code: 'platform_unavailable', message: `课程列表 HTTP ${result.response.status}` };
+  }
+  await hostCall('cw.state', {
+    session,
+    namespace: CATALOG_NAMESPACE,
+    key: `courses:${accountKey(String(auth?.open_id ?? ''))}`,
+    value: cards,
+  });
+  log('info', `catalog.courses openId=${auth?.open_id ?? ''} courses=${cards.length}`);
+  return cards;
 }
 
 async function ensureContentSession(session: string, courseId: string): Promise<void> {
@@ -423,41 +582,123 @@ async function ensureContentSession(session: string, courseId: string): Promise<
   }
 }
 
-async function loadCourse(session: string): Promise<{ id: string; name: string }> {
-  if (COURSE_ID) return { id: COURSE_ID, name: 'U校园课程' };
-  if (!CLASS_URL) throw { code: 'invalid_params', message: '请在模块设置里配置 class_url' };
+async function catalogCourses(params: any) {
+  const session = String(params.session ?? '');
   const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
-  const response = await fetcher(CLASS_URL, {
-    headers: { ...BROWSER_HEADERS, accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', referer: CLASS_URL },
-  });
-  if (!response.ok) {
-    throw { code: 'platform_unavailable', message: `课程目录页 HTTP ${response.status}` };
-  }
-  void auth;
-  return courseFromCatalog(await response.text());
+  const cards = await fetchCourseList(session, auth);
+  return {
+    courses: cards.map((card) => ({
+      id: card.api_course_id,
+      recruit_id: card.class_id,
+      name: card.name,
+      kind: 'shared',
+      kind_label: 'U校园课程',
+      family: 'shared',
+      progress: null,
+      outline_available: true,
+    })),
+  };
 }
 
-async function catalogCourses(params: any) {
-  if (!CLASS_URL && !COURSE_ID) {
-    throw { code: 'invalid_params', message: '请在模块设置里配置 class_url 或 course_id' };
-  }
-  await readAuth(String(params.session ?? ''));
-  const course = await loadCourse(String(params.session ?? ''));
-  return {
-    courses: [
-      {
-        id: course.id,
-        recruit_id: course.id,
-        name: course.name,
-        kind: 'shared',
-        kind_label: '共享课',
-        family: 'shared',
-        progress: null,
-        outline_available: true,
-      },
-    ],
+async function resolveCourse(session: string, publicCourse: any, auth: any): Promise<CourseContext> {
+  const openId = String(auth?.open_id ?? '');
+  const wantedId = String(publicCourse?.id ?? '').trim();
+  const wantedClass = String(publicCourse?.recruit_id ?? '').trim();
+  let cards = await readCourseCards(session, openId);
+
+  const findCard = (values: CourseCard[]): CourseCard | null => {
+    const matches = values.filter(
+      (card) => (!wantedId || card.api_course_id === wantedId)
+        && (!wantedClass || card.class_id === wantedClass),
+    );
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw { code: 'invalid_params', message: '该课程有多个班级，请重新选择课程和班级' };
+    }
+    return null;
   };
+
+  let card: CourseCard | null = null;
+  if (wantedId || wantedClass) {
+    card = findCard(cards ?? []);
+    if (!card) {
+      cards = await fetchCourseList(session, auth);
+      card = findCard(cards);
+    }
+    if (!card) throw { code: 'not_found', message: '当前账号下找不到这门课程，请刷新课程列表' };
+  } else {
+    if (!cards) cards = await fetchCourseList(session, auth);
+    const selected = await hostCall('cw.state', {
+      session,
+      namespace: CATALOG_NAMESPACE,
+      key: `selected:${accountKey(openId)}`,
+    });
+    const selectedId = String(selected?.value?.id ?? '');
+    const selectedClass = String(selected?.value?.recruit_id ?? '');
+    if (selectedId || selectedClass) {
+      const found = (cards ?? []).find(
+        (value) => (!selectedId || value.api_course_id === selectedId)
+          && (!selectedClass || value.class_id === selectedClass),
+      );
+      if (found) card = found;
+    }
+    if (!card && (cards ?? []).length === 1) card = cards![0];
+    if (!card) throw { code: 'invalid_params', message: '请先在课程列表里选择一门课程' };
+  }
+
+  const key = courseStateKey(openId, card.api_course_id, card.class_id);
+  const stored = await hostCall('cw.state', { session, namespace: CATALOG_NAMESPACE, key });
+  const cached = stored?.value;
+  let context: CourseContext | null = cached?.content_id
+    && String(cached.open_id ?? '') === openId
+    && String(cached.api_course_id ?? '') === card.api_course_id
+    && String(cached.class_id ?? '') === card.class_id
+    && String(cached.ecc_id ?? '') === card.ecc_id
+    && String(cached.course_type ?? '') === card.course_type
+    ? {
+      ...cached,
+      ...card,
+      content_id: String(cached.content_id),
+      version: String(cached.version || 'default'),
+      open_id: openId,
+    }
+    : null;
+
+  if (!context) {
+    const page = await follow(session, card.catalog_url, 6);
+    if (isLoginHtml(page.body)) {
+      throw { code: 'platform_login_expired', message: 'U校园登录已过期，请重新连接' };
+    }
+    if (!page.response.ok) {
+      throw { code: 'platform_unavailable', message: `课程目录页 HTTP ${page.response.status}` };
+    }
+    const shell = parseCourseShell(page.body);
+    if (!shell.content_id) {
+      throw { code: 'platform_protocol_changed', message: '课程目录页里没有找到 course_id' };
+    }
+    if (shell.db_course_id && shell.db_course_id !== card.api_course_id) {
+      throw { code: 'platform_protocol_changed', message: '课程目录页与课程列表不一致，请刷新课程列表' };
+    }
+    if (shell.class_id && shell.class_id !== card.class_id) {
+      throw { code: 'platform_protocol_changed', message: '课程目录页与所选班级不一致，请重新选择' };
+    }
+    context = {
+      ...card,
+      content_id: shell.content_id,
+      version: shell.version || 'default',
+      open_id: openId,
+    };
+    await hostCall('cw.state', { session, namespace: CATALOG_NAMESPACE, key, value: context });
+    log('info', `course resolved ${card.api_course_id}/${card.class_id} -> ${context.content_id}`);
+  }
+
+  await hostCall('cw.state', {
+    session,
+    namespace: CATALOG_NAMESPACE,
+    key: `selected:${accountKey(openId)}`,
+    value: { id: card.api_course_id, recruit_id: card.class_id, at: Date.now() },
+  });
+  return context;
 }
 
 async function fetchText(session: string, url: string, headers: Record<string, string>, stage = 'read') {
@@ -478,11 +719,8 @@ function annotatorHeaders(auth: any): Record<string, string> {
 async function catalogUnits(params: any) {
   const session = String(params.session ?? '');
   const auth = await readAuth(session);
-  const course = await loadCourse(session);
-  const courseId = course.id;
-  if (params.course?.id && params.course.id !== courseId) {
-    throw { code: 'not_found', message: '课程不存在' };
-  }
+  const course = await resolveCourse(session, params.course, auth);
+  const courseId = course.content_id;
   await ensureContentSession(session, courseId);
 
   const treeResult = await fetchText(
@@ -1279,10 +1517,11 @@ function isSinglePageTask(questionsList: any[]): boolean {
   return pages.size <= 1;
 }
 
-function coursewareUrl(courseId: string, groupId: string, questionsList: any[]) {
+function coursewareUrl(courseId: string, groupId: string, questionsList: any[], course: CourseContext) {
   const parentPath = questionsList?.[0]?.path?.[1] ?? [];
   const coursewarePath = [...parentPath, groupId];
-  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}#/${courseId}/courseware/${coursewarePath.join('/')}/p_1`;
+  const school = course.school_id ? `&schId=${encodeURIComponent(course.school_id)}` : '';
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${encodeURIComponent(course.class_id)}&appid=5${school}#/${courseId}/courseware/${coursewarePath.join('/')}/p_1`;
 }
 
 async function browserStudy(
@@ -1340,7 +1579,7 @@ async function browserStudy(
 
 async function studyFillblankBrowser(
   session: string,
-  courseId: string,
+  course: CourseContext,
   groupId: string,
   decoded: any,
   questionGroup: any,
@@ -1348,6 +1587,7 @@ async function studyFillblankBrowser(
   auth: any,
   minScorePct: number,
 ) {
+  const courseId = course.content_id;
   let answers = scriptAnswers(decoded);
   if (answers.length === 0) {
     const context = await collectStudyContext(session, decoded);
@@ -1365,7 +1605,7 @@ async function studyFillblankBrowser(
     session,
     courseId,
     groupId,
-    coursewareUrl(courseId, groupId, questionsList),
+    coursewareUrl(courseId, groupId, questionsList, course),
     'fill',
     answers,
     auth,
@@ -1412,7 +1652,7 @@ function choiceCaptions(group: any, solved: Record<string, string[]>): string[] 
 
 async function studyChoiceBrowser(
   session: string,
-  courseId: string,
+  course: CourseContext,
   groupId: string,
   decoded: any,
   questionGroup: any,
@@ -1420,6 +1660,7 @@ async function studyChoiceBrowser(
   auth: any,
   minScorePct: number,
 ) {
+  const courseId = course.content_id;
   const context = await collectStudyContext(session, decoded);
   const solved = await solveChoiceQuestions(session, questionGroup, context);
   if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
@@ -1428,7 +1669,7 @@ async function studyChoiceBrowser(
     session,
     courseId,
     groupId,
-    coursewareUrl(courseId, groupId, questionsList),
+    coursewareUrl(courseId, groupId, questionsList, course),
     'choice',
     captions,
     auth,
@@ -1742,12 +1983,13 @@ async function studyShortAnswerApi(
 
 /* ------------------------------------------------------- unit test paper */
 
-function paperCoursewareUrl(courseId: string, unit: any): string | null {
+function paperCoursewareUrl(course: CourseContext, unit: any): string | null {
   const path: string[] = Array.isArray(unit?.courseware_path)
     ? unit.courseware_path.map((item: any) => String(item ?? '')).filter(Boolean)
     : [];
   if (path.length < 2) return null;
-  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${CLASS_ID}&appid=5&schId=${SCHOOL_ID}&appName=3001#/${courseId}/courseware/${path.join('/')}/p_1`;
+  const school = course.school_id ? `&schId=${encodeURIComponent(course.school_id)}` : '';
+  return `${UCONTENT_BASE}/_pc_default/pc.html?cid=${encodeURIComponent(course.class_id)}&appid=5${school}&appName=3001#/${course.content_id}/courseware/${path.join('/')}/p_1`;
 }
 
 function stripOptionPrefix(value: any): string {
@@ -2201,7 +2443,8 @@ async function paperProgress(session: string, courseId: string, groupId: string,
   }
 }
 
-async function studyQuizPaper(session: string, courseId: string, unit: any, auth: any) {
+async function studyQuizPaper(session: string, course: CourseContext, unit: any, auth: any) {
+  const courseId = course.content_id;
   const groupId = String(unit.id ?? '').split('::')[0];
   if (!UNIT_TEST_ENABLED) {
     return {
@@ -2210,7 +2453,7 @@ async function studyQuizPaper(session: string, courseId: string, unit: any, auth
       evidence: { exam: unit.exam ?? null },
     };
   }
-  const url = paperCoursewareUrl(courseId, unit);
+  const url = paperCoursewareUrl(course, unit);
   if (!url) {
     return { status: 'needs_human', reason: '单元测试缺少课件路径', evidence: { exam: unit.exam ?? null } };
   }
@@ -2369,10 +2612,11 @@ async function studyQuizPaper(session: string, courseId: string, unit: any, auth
   }
 }
 
-async function studyTask(session: string, courseId: string, unit: any, auth: any) {
+async function studyTask(session: string, course: CourseContext, unit: any, auth: any) {
+  const courseId = course.content_id;
   const groupId = String(unit.id ?? '').split('::')[0];
   if (String(unit.selectable_note ?? '') === 'quiz-paper-link' || unit.exam) {
-    return studyQuizPaper(session, courseId, unit, auth);
+    return studyQuizPaper(session, course, unit, auth);
   }
   let minScorePct = 0;
   let progressData: any = null;
@@ -2456,7 +2700,7 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     }
     if (BROWSER_STUDY) {
       const browserResult: any = await studyFillblankBrowser(
-        session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
+        session, course, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
       );
       if (browserResult.status === 'completed') return browserResult;
       const rawState = browserResult?.evidence?.state;
@@ -2488,7 +2732,7 @@ async function studyTask(session: string, courseId: string, unit: any, auth: any
     }
     if (BROWSER_STUDY) {
       const browserResult: any = await studyChoiceBrowser(
-        session, courseId, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
+        session, course, groupId, decoded, questionGroup, questionsList, auth, minScorePct,
       );
       if (browserResult.status === 'completed') return browserResult;
       const rawState = browserResult?.evidence?.state;
@@ -2542,11 +2786,11 @@ async function studyStep(params: any) {
   const rawId = String(unit.id ?? '');
   if (!rawId) throw { code: 'invalid_params', message: '缺少单元 id' };
   const auth = await readAuth(session);
-  const course = await loadCourse(session);
+  const course = await resolveCourse(session, params.course, auth);
   if (String(unit.kind) === 'document') {
-    return studyTask(session, course.id, unit, auth);
+    return studyTask(session, course, unit, auth);
   }
-  return studyLeaf(session, course.id, unit, auth);
+  return studyLeaf(session, course.content_id, unit, auth);
 }
 
 // ------------------------------------------------------------------ rpc
