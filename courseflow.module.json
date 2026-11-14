@@ -4,7 +4,7 @@
   "name": "U校园普通版",
   "version": "0.2.0",
   "moduleApi": 1,
-  "engines": { "framework": ">=0.1.1 <0.2.0" },
+  "engines": { "framework": ">=0.1.6 <0.2.0" },
   "runtime": { "engine": "node", "entry": "index.mjs", "files": ["scripts/transcribe_audio.py"] },
   "platform": {
     "id": "unipus_classic",
@@ -25,6 +25,7 @@
     "browser": true,
     "ai": true,
     "asr": true,
+    "question_bank": true,
     "storage": "module"
   }
 }

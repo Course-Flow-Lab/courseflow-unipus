@@ -6,6 +6,186 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+// src/bank.ts
+var host = null;
+function bindBank(value) {
+  host = value;
+}
+function plain(value) {
+  return String(value ?? "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
+}
+function bankKind(category) {
+  const value = String(category ?? "").trim().toLowerCase();
+  if (value === "singlechoice" || value === "choice") return "single";
+  if (value === "multichoice" || value === "multi_choice") return "multiple";
+  if (value === "truefalse" || value === "true_false") return "judge";
+  if (/^fillblank/.test(value)) return "blank";
+  return null;
+}
+var TRUE_WORDS = /* @__PURE__ */ new Set(["true", "t", "yes", "y", "\u6B63\u786E", "\u5BF9", "\u221A"]);
+var FALSE_WORDS = /* @__PURE__ */ new Set(["false", "f", "no", "n", "\u9519\u8BEF", "\u9519", "\xD7"]);
+function judgeValue(value) {
+  const text = plain(value).toLowerCase().replace(/[.。:：!！\s]/g, "");
+  if (!text) return null;
+  if (TRUE_WORDS.has(text)) return "true";
+  if (FALSE_WORDS.has(text)) return "false";
+  return null;
+}
+function optionList(question) {
+  return (Array.isArray(question?.options) ? question.options : []).map((option) => ({
+    id: String(option?.caption ?? "").trim(),
+    text: plain(option?.content?.html)
+  }));
+}
+function hasDuplicate(values) {
+  return new Set(values).size !== values.length;
+}
+function blankSlots(text) {
+  return (text.match(/_{2,}|\{\{\d+\}\}/g) ?? []).length;
+}
+function toBankQuestion(category, question) {
+  const kind = bankKind(category);
+  if (!kind) return null;
+  const text = plain(question?.content?.html);
+  if (!text) return null;
+  if (kind === "blank") {
+    if (blankSlots(text) > 1) return null;
+    return { kind, text, options: [], blanks: 1 };
+  }
+  const options = optionList(question);
+  if (options.length === 0) return null;
+  for (const option of options) {
+    if (!option.id || !option.text) return null;
+  }
+  if (hasDuplicate(options.map((option) => option.id))) return null;
+  if (hasDuplicate(options.map((option) => option.text))) return null;
+  if (kind === "judge") {
+    if (options.length !== 2) return null;
+    const values = options.map((option) => judgeValue(option.text));
+    if (values.some((value) => value === null)) return null;
+    if (new Set(values).size !== 2) return null;
+  }
+  return { kind, text, options, blanks: 0 };
+}
+function matchOption(question, value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const byId = question.options.find((option) => option.id === raw);
+  if (byId) return byId;
+  const byText = question.options.filter((option) => option.text === raw);
+  return byText.length === 1 ? byText[0] : null;
+}
+function bankAnswerToCaptions(question, answer) {
+  if (!Array.isArray(answer) || answer.length === 0) return null;
+  if (question.kind === "blank") {
+    if (answer.length !== 1) return null;
+    const values = answer.map((value) => String(value ?? "").trim()).filter(Boolean);
+    return values.length ? values : null;
+  }
+  if (question.kind === "judge") {
+    if (answer.length !== 1) return null;
+    const raw = String(answer[0] ?? "").trim().toLowerCase();
+    const semantic = raw === "true" || raw === "false" ? raw : judgeValue(raw);
+    if (!semantic) return null;
+    const option = question.options.find((value) => judgeValue(value.text) === semantic);
+    return option ? [option.id] : null;
+  }
+  if (question.kind === "single" && answer.length !== 1) return null;
+  const out = [];
+  for (const value of answer) {
+    const option = matchOption(question, value);
+    if (!option || out.includes(option.id)) return null;
+    out.push(option.id);
+  }
+  return out.length ? out : null;
+}
+function toBankAnswer(question, values) {
+  if (question.kind === "blank") {
+    if (values?.length !== 1) return null;
+    const text = String(values[0] ?? "").trim();
+    return text ? [text] : null;
+  }
+  if (question.kind === "judge") {
+    if (values?.length !== 1) return null;
+    const raw = String(values[0] ?? "").trim().toLowerCase();
+    if (raw === "true" || raw === "false") return [raw];
+    const option = matchOption(question, values[0]);
+    const semantic = option ? judgeValue(option.text) : null;
+    return semantic ? [semantic] : null;
+  }
+  if (question.kind === "single" && values?.length !== 1) return null;
+  const out = [];
+  for (const value of values ?? []) {
+    const option = matchOption(question, value);
+    if (!option || out.includes(option.id)) return null;
+    out.push(option.id);
+  }
+  return out.length ? out : null;
+}
+function courseScope(course) {
+  const contentId = String(course?.content_id ?? "").trim();
+  const classId = String(course?.class_id ?? "").trim();
+  if (!contentId || !classId) return null;
+  return `${contentId}:${classId}`;
+}
+async function lookupAnswers(session, course, entries) {
+  const out = {};
+  if (!host || !course || !Array.isArray(entries)) return out;
+  for (const entry of entries) {
+    const question = toBankQuestion(entry.category, entry.question);
+    if (!question) continue;
+    try {
+      const result = await host.call("cw.question_bank.lookup", {
+        session,
+        course,
+        question
+      });
+      const captions = bankAnswerToCaptions(question, result?.correct);
+      if (captions) out[entry.index] = captions;
+    } catch (error) {
+      host.log?.("warn", `question bank lookup skipped: ${errorText(error)}`);
+    }
+  }
+  return out;
+}
+async function confirmCorrect(session, course, question, answer, reference) {
+  if (!host) return false;
+  try {
+    await host.call("cw.question_bank.confirm", {
+      session,
+      course,
+      question,
+      answer,
+      confirmation: { confirmed: true, source: "platform", reference }
+    });
+    return true;
+  } catch (error) {
+    host.log?.("warn", `question bank confirm skipped: ${errorText(error)}`);
+    return false;
+  }
+}
+async function confirmGroup(session, course, category, questions, answers, reference) {
+  if (!host || !course || !Array.isArray(questions)) return 0;
+  let saved = 0;
+  for (let index = 0; index < questions.length; index += 1) {
+    const question = toBankQuestion(category, questions[index]);
+    if (!question) continue;
+    const raw = answers?.[index];
+    const values = Array.isArray(raw) ? raw.map(String) : [String(raw ?? "")];
+    const answer = toBankAnswer(question, values);
+    if (!answer) continue;
+    if (await confirmCorrect(session, course, question, answer, reference)) saved += 1;
+  }
+  return saved;
+}
+function errorText(error) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") return String(error.message ?? error.code ?? error);
+  return String(error);
+}
+
+// src/module.ts
 var MANIFEST = JSON.parse(
   readFileSync(new URL("./courseflow.module.json", import.meta.url), "utf8")
 );
@@ -45,6 +225,7 @@ var write = (message) => process.stdout.write(`${JSON.stringify(message)}
 `);
 var log = (level, message) => process.stderr.write(`[unipus-classic] ${level} ${message}
 `);
+bindBank({ call: hostCall, log });
 var nextId = 1;
 var pending = /* @__PURE__ */ new Map();
 function hostCall(method, params) {
@@ -53,7 +234,7 @@ function hostCall(method, params) {
   write({ jsonrpc: "2.0", id, method, params });
   return promise;
 }
-function errorText(error) {
+function errorText2(error) {
   if (error instanceof Error) return error.message;
   if (error && typeof error === "object") {
     return error.code ? `${error.code}: ${error.message}` : String(error.message ?? error);
@@ -164,7 +345,7 @@ async function kickOtherSession(session) {
     await follow(session, `${UNIPUS_BASE}/logout?school_id=&repeatLogin=1`, 6);
     await follow(session, `${UNIPUS_BASE}/user/comm/login?school_id=`, 4);
   } catch (error) {
-    log("warn", `logout other session failed: ${errorText(error)}`);
+    log("warn", `logout other session failed: ${errorText2(error)}`);
   }
 }
 async function casLogin(session, username, password) {
@@ -272,7 +453,7 @@ async function authSubmit(params) {
     return { state: "connected" };
   } catch (error) {
     challenge.state = "failed";
-    challenge.message = errorText(error);
+    challenge.message = errorText2(error);
     log("warn", `auth.submit failed: ${challenge.message}`);
     return { state: "failed", message: challenge.message };
   }
@@ -307,7 +488,7 @@ async function authKeepalive(params) {
     const state = await readAuth(String(params.session ?? ""));
     return { ok: Boolean(state?.token), expires_at: null };
   } catch (error) {
-    return { ok: false, reason: errorText(error) };
+    return { ok: false, reason: errorText2(error) };
   }
 }
 async function readAuth(session) {
@@ -369,8 +550,8 @@ function parseCourseCards(html) {
     } catch {
       continue;
     }
-    const host = new URL(UNIPUS_BASE).hostname;
-    if (url.hostname !== host || url.pathname !== COURSE_CATALOG_PATH) continue;
+    const host2 = new URL(UNIPUS_BASE).hostname;
+    if (url.hostname !== host2 || url.pathname !== COURSE_CATALOG_PATH) continue;
     const query = url.searchParams;
     const apiCourseId = String(query.get("courseId") ?? "").trim();
     const classId = String(query.get("classId") ?? "").trim();
@@ -465,7 +646,7 @@ async function ensureContentSession(session, courseId) {
   try {
     await follow(session, `${UCONTENT_BASE}/cas-auth/login/?next=${next}`, 6);
   } catch (error) {
-    log("warn", `ucontent session failed: ${errorText(error)}`);
+    log("warn", `ucontent session failed: ${errorText2(error)}`);
   }
 }
 async function catalogCourses(params) {
@@ -627,7 +808,7 @@ async function catalogUnits(params) {
       const parsed = JSON.parse(progress.text);
       leafs = parsed?.rt?.leafs ?? {};
     } catch (error) {
-      log("warn", `progress ${unitId} failed: ${errorText(error)}`);
+      log("warn", `progress ${unitId} failed: ${errorText2(error)}`);
     }
     const walk = (node, parentId, grandId) => {
       if (node?.role === "link" && node.url) {
@@ -814,7 +995,7 @@ async function fetchUserState(session, courseId, groupId, auth) {
     return null;
   }
 }
-async function solveChoiceQuestions(session, group, context = "") {
+async function solveChoiceQuestions(session, group, context = "", scope = null) {
   const questions = (group.questions ?? []).map((question, index) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html),
@@ -824,6 +1005,26 @@ async function solveChoiceQuestions(session, group, context = "") {
     }))
   }));
   if (questions.length === 0) return null;
+  const category = String(group.category ?? "").toLowerCase();
+  const out = {};
+  let pending2 = questions;
+  if (scope) {
+    const hits = await lookupAnswers(
+      session,
+      scope,
+      questions.map((question) => ({
+        index: Number(question.id),
+        category,
+        question: group.questions?.[Number(question.id)]
+      }))
+    );
+    for (const [index, captions] of Object.entries(hits)) out[index] = captions;
+    pending2 = questions.filter((question) => !out[question.id]);
+    if (Object.keys(out).length > 0) {
+      log("info", `bank choice hit ${Object.keys(out).length}/${questions.length}`);
+    }
+    if (pending2.length === 0) return out;
+  }
   const contextBlock = context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
 ${context.trim()}
 ` : "";
@@ -833,7 +1034,7 @@ ${context.trim()}
     '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
     "\u9009\u62E9\u9898 texts \u8FD4\u56DE\u6B63\u786E\u9009\u9879\u7684 caption\uFF08A/B/C/D\uFF09\uFF0C\u5982\u679C\u4E0D\u786E\u5B9A caption\uFF0C\u8FD4\u56DE\u9009\u9879\u539F\u6587\u3002",
     contextBlock,
-    JSON.stringify(questions)
+    JSON.stringify(pending2)
   ].join("\n");
   if (context.trim()) log("info", `choice context ${context.trim().length} chars`);
   let parsed = null;
@@ -851,7 +1052,6 @@ ${context.trim()}
     }
   }
   if (!Array.isArray(parsed)) return null;
-  const out = {};
   for (const item of parsed) {
     if (!item || typeof item !== "object") continue;
     const id = String(item.id ?? "");
@@ -910,7 +1110,7 @@ ${context.trim()}` : "",
   ].join("\n");
   return answerMapFromItems(await askAiForItems(session, prompt));
 }
-async function solveMultiChoiceQuestions(session, group, context = "") {
+async function solveMultiChoiceQuestions(session, group, context = "", scope = null) {
   const questions = (group.questions ?? []).map((question, index) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html),
@@ -920,6 +1120,26 @@ async function solveMultiChoiceQuestions(session, group, context = "") {
     }))
   }));
   if (questions.length === 0) return null;
+  const category = String(group.category ?? "").toLowerCase();
+  const out = {};
+  let pending2 = questions;
+  if (scope) {
+    const hits = await lookupAnswers(
+      session,
+      scope,
+      questions.map((question) => ({
+        index: Number(question.id),
+        category,
+        question: group.questions?.[Number(question.id)]
+      }))
+    );
+    for (const [index, captions] of Object.entries(hits)) out[index] = captions;
+    pending2 = questions.filter((question) => !out[question.id]);
+    if (Object.keys(out).length > 0) {
+      log("info", `bank multiple hit ${Object.keys(out).length}/${questions.length}`);
+    }
+    if (pending2.length === 0) return out;
+  }
   const prompt = [
     "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
     "\u8FD9\u662F\u591A\u9009\u9898\uFF0C\u6BCF\u9053\u9898\u53EF\u80FD\u6709\u591A\u4E2A\u6B63\u786E\u9009\u9879\u3002",
@@ -927,9 +1147,17 @@ async function solveMultiChoiceQuestions(session, group, context = "") {
     '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["A","C"]}\u3002',
     context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
 ${context.trim()}` : "",
-    JSON.stringify(questions)
+    JSON.stringify(pending2)
   ].join("\n");
-  return answerMapFromItems(await askAiForItems(session, prompt));
+  const parsed = await askAiForItems(session, prompt);
+  if (!parsed) return null;
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    const id = String(item.id ?? "");
+    const texts = Array.isArray(item.texts) ? item.texts.map(String) : Array.isArray(item.answers) ? item.answers.map(String) : [];
+    if (id) out[id] = texts;
+  }
+  return out;
 }
 function parseVtt(text) {
   const out = [];
@@ -960,7 +1188,7 @@ async function transcribeAudio(session, audioUrl) {
       binary: true
     });
   } catch (error) {
-    log("warn", `asr download failed: ${errorText(error)}`);
+    log("warn", `asr download failed: ${errorText2(error)}`);
     return "";
   }
   if (!binary?.body) return "";
@@ -978,7 +1206,7 @@ async function transcribeAudio(session, audioUrl) {
       return text;
     }
   } catch (error) {
-    log("warn", `host asr unavailable: ${errorText(error)}`);
+    log("warn", `host asr unavailable: ${errorText2(error)}`);
   }
   let dir = "";
   const scriptPath = fileURLToPath(new URL("./scripts/transcribe_audio.py", import.meta.url));
@@ -1025,7 +1253,7 @@ async function transcribeAudio(session, audioUrl) {
     }
     return text;
   } catch (error) {
-    log("warn", `asr failed: ${errorText(error)}`);
+    log("warn", `asr failed: ${errorText2(error)}`);
     return "";
   } finally {
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -1057,7 +1285,7 @@ async function collectStudyContext(session, decoded) {
           const parsed = parseVtt(text);
           if (parsed) parts.push(parsed);
         } catch (error) {
-          log("warn", `vtt ${videoFile} failed: ${errorText(error)}`);
+          log("warn", `vtt ${videoFile} failed: ${errorText2(error)}`);
         }
       }
       const audioUrl = content?.audio?.audio?.url;
@@ -1103,12 +1331,33 @@ function pageMeta(indexMap, pageId) {
   walk(indexMap?.[pageId] ?? {});
   return found ?? { rules: [] };
 }
-async function solveTextQuestions(session, group, context = "") {
+async function solveTextQuestions(session, group, context = "", scope = null) {
   const questions = (group.questions ?? []).map((question, index) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html)
   }));
   if (questions.length === 0) return null;
+  const category = String(group.category ?? "").toLowerCase();
+  const isFill = /fillblank/.test(category);
+  const out = {};
+  let pending2 = questions;
+  if (scope && isFill) {
+    const hits = await lookupAnswers(
+      session,
+      scope,
+      questions.map((question) => ({
+        index: Number(question.id),
+        category,
+        question: group.questions?.[Number(question.id)]
+      }))
+    );
+    for (const [index, texts] of Object.entries(hits)) out[index] = texts;
+    pending2 = questions.filter((question) => !out[question.id]);
+    if (Object.keys(out).length > 0) {
+      log("info", `bank fillblank hit ${Object.keys(out).length}/${questions.length}`);
+    }
+    if (pending2.length === 0) return out;
+  }
   const prompt = [
     "\u4F60\u662F U\u6821\u56ED\u82F1\u8BED\u7EC3\u4E60\u7B54\u9898\u52A9\u624B\u3002",
     '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
@@ -1116,7 +1365,7 @@ async function solveTextQuestions(session, group, context = "") {
     "\u539F\u6587\u91CC\u7684 ____1____\u3001____2____ \u662F\u5F85\u586B\u7A7A\u4F4D\uFF0C\u9898\u76EE id \u5BF9\u5E94\u7A7A\u4F4D\u7F16\u53F7\uFF0C\u6309\u7F16\u53F7\u586B\u5199\u3002",
     context.trim() ? `\u542C\u529B/\u89C6\u9891\u539F\u6587\uFF1A
 ${context.trim()}` : "",
-    JSON.stringify(questions)
+    JSON.stringify(pending2)
   ].join("\n");
   let parsed = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1133,7 +1382,6 @@ ${context.trim()}` : "",
     }
   }
   if (!Array.isArray(parsed)) return null;
-  const out = {};
   for (const item of parsed) {
     if (!item || typeof item !== "object") continue;
     const id = String(item.id ?? "");
@@ -1273,7 +1521,7 @@ async function browserStudy(session, courseId, groupId, url, mode, values, auth,
   try {
     opened = await hostCall("cw.browser.open", { session, url, purpose: "study" });
   } catch (error) {
-    return { status: "needs_human", reason: `\u5B98\u65B9\u6D4F\u89C8\u5668\u4E0D\u53EF\u7528\uFF1A${errorText(error)}` };
+    return { status: "needs_human", reason: `\u5B98\u65B9\u6D4F\u89C8\u5668\u4E0D\u53EF\u7528\uFF1A${errorText2(error)}` };
   }
   const page = opened?.page;
   if (!page) return { status: "needs_human", reason: "\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4" };
@@ -1289,8 +1537,8 @@ async function browserStudy(session, courseId, groupId, url, mode, values, auth,
     log("info", `browser ${mode} ${groupId}: ${JSON.stringify(result).slice(0, 200)}`);
     await new Promise((resolve) => setTimeout(resolve, 4e3));
   } catch (error) {
-    result = { error: errorText(error) };
-    log("warn", `browser ${mode} ${groupId} failed: ${errorText(error)}`);
+    result = { error: errorText2(error) };
+    log("warn", `browser ${mode} ${groupId} failed: ${errorText2(error)}`);
   } finally {
     await hostCall("cw.browser.close", { session, page }).catch(() => {
     });
@@ -1314,10 +1562,11 @@ async function browserStudy(session, courseId, groupId, url, mode, values, auth,
 }
 async function studyFillblankBrowser(session, course, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
   const courseId = course.content_id;
+  const scope = courseScope(course);
   let answers = scriptAnswers(decoded);
   if (answers.length === 0) {
     const context = await collectStudyContext(session, decoded);
-    const solved = await solveTextQuestions(session, questionGroup, context);
+    const solved = await solveTextQuestions(session, questionGroup, context, scope);
     if (solved) {
       answers = (questionGroup.questions ?? []).map(
         (_, index) => solved[String(index)]?.[0] ?? ""
@@ -1337,6 +1586,17 @@ async function studyFillblankBrowser(session, course, groupId, decoded, question
     auth,
     minScorePct
   );
+  if (result.status === "completed" && scope && Number(result.evidence?.score ?? 0) >= 100) {
+    const saved = await confirmGroup(
+      session,
+      scope,
+      questionGroup.category,
+      questionGroup.questions ?? [],
+      answers,
+      `study:${groupId}:browser`
+    );
+    if (saved > 0) log("info", `bank confirm fillblank ${saved} after 100`);
+  }
   return {
     ...result,
     evidence: { ...result.evidence, fill_answers: answers }
@@ -1375,8 +1635,9 @@ function choiceCaptions(group, solved) {
 }
 async function studyChoiceBrowser(session, course, groupId, decoded, questionGroup, questionsList, auth, minScorePct) {
   const courseId = course.content_id;
+  const scope = courseScope(course);
   const context = await collectStudyContext(session, decoded);
-  const solved = await solveChoiceQuestions(session, questionGroup, context);
+  const solved = await solveChoiceQuestions(session, questionGroup, context, scope);
   if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
   const captions = choiceCaptions(questionGroup, solved);
   const result = await browserStudy(
@@ -1389,12 +1650,23 @@ async function studyChoiceBrowser(session, course, groupId, decoded, questionGro
     auth,
     minScorePct
   );
+  if (result.status === "completed" && scope && Number(result.evidence?.score ?? 0) >= 100) {
+    const saved = await confirmGroup(
+      session,
+      scope,
+      questionGroup.category,
+      questionGroup.questions ?? [],
+      captions,
+      `study:${groupId}:browser`
+    );
+    if (saved > 0) log("info", `bank confirm choice ${saved} after 100`);
+  }
   return {
     ...result,
     evidence: { ...result.evidence, choice_answers: captions }
   };
 }
-async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, precomputedValues) {
+async function studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, precomputedValues, scope = null) {
   const category = String(questionGroup.category ?? "").toLowerCase();
   const isFill = /fillblank/.test(category);
   const isSequence = category === "sequence";
@@ -1406,7 +1678,7 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
     if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
       const context = await collectStudyContext(session, decoded);
-      const solved = await solveTextQuestions(session, questionGroup, context);
+      const solved = await solveTextQuestions(session, questionGroup, context, scope);
       if (!solved) return { status: "needs_human", reason: "fillblankScoop \u6CA1\u6709\u7B54\u6848\u6765\u6E90" };
       values = questions.map((_, index) => solved[String(index)]?.[0] ?? "");
     }
@@ -1420,14 +1692,14 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
   } else if (isMulti) {
     if (values.length === 0) {
       const context = await collectStudyContext(session, decoded);
-      const solved = await solveMultiChoiceQuestions(session, questionGroup, context);
+      const solved = await solveMultiChoiceQuestions(session, questionGroup, context, scope);
       if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u591A\u9009\u9898\u7B54\u6848" };
       values = questions.map((_, index) => solved[String(index)] ?? []);
     }
   } else if (choice) {
     if (values.length === 0) {
       const context = await collectStudyContext(session, decoded);
-      const solved = await solveChoiceQuestions(session, choice.group, context);
+      const solved = await solveChoiceQuestions(session, choice.group, context, scope);
       if (!solved) return { status: "needs_human", reason: "\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u7684\u9009\u62E9\u9898\u7B54\u6848" };
       values = choiceCaptions(choice.group, solved);
     }
@@ -1536,6 +1808,17 @@ async function studyObjectiveApi(session, courseId, groupId, decoded, questionGr
   const submitState = Number(info?.state?.state ?? 0);
   const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
   const score = info?.state?.score ?? null;
+  if (submitState === 1 && scorePct === 100 && scope && !isSequence && !multiPage) {
+    const saved = await confirmGroup(
+      session,
+      scope,
+      category,
+      questions,
+      values,
+      `study:${groupId}:api`
+    );
+    if (saved > 0) log("info", `bank confirm ${category} ${saved} after 100`);
+  }
   if (submitState === 1 && (minScorePct === 0 || scorePct >= minScorePct)) {
     return {
       status: "completed",
@@ -1870,7 +2153,7 @@ async function solvePaperAnswers(session, details) {
         answers[question.index] = String(Array.isArray(raw) ? raw[0] : raw).trim();
       }
     } catch (error) {
-      log("warn", `paper question ${question.index}: ${errorText(error)}`);
+      log("warn", `paper question ${question.index}: ${errorText2(error)}`);
     }
   }
   return answers;
@@ -2186,7 +2469,7 @@ async function studyQuizPaper(session, course, unit, auth) {
         expression: `(${submitUnitTestPaper.toString()})()`
       });
     } catch (error) {
-      log("warn", `paper submit evaluate failed: ${errorText(error)}`);
+      log("warn", `paper submit evaluate failed: ${errorText2(error)}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 4e3));
     await hostCall("cw.browser.close", { session, page: paperPage }).catch(() => {
@@ -2216,7 +2499,7 @@ async function studyQuizPaper(session, course, unit, auth) {
       evidence: { state, score_pct: scorePct, submit: submitResult, exam: unit.exam ?? null }
     };
   } catch (error) {
-    return { status: "needs_human", reason: `\u5355\u5143\u6D4B\u8BD5\u6D41\u7A0B\u5931\u8D25\uFF1A${errorText(error)}` };
+    return { status: "needs_human", reason: `\u5355\u5143\u6D4B\u8BD5\u6D41\u7A0B\u5931\u8D25\uFF1A${errorText2(error)}` };
   } finally {
     if (keepAlive) clearInterval(keepAlive);
     if (paperPage) await hostCall("cw.browser.close", { session, page: paperPage }).catch(() => {
@@ -2303,6 +2586,8 @@ async function studyTask(session, course, unit, auth) {
   const category = String(questionGroup.category ?? "").toLowerCase();
   const isFill = /fillblank/.test(category);
   const isChoice = category === "singlechoice" || category === "truefalse" || category === "true_false" || category === "choice";
+  const singlePage = isSinglePageTask(questionsList);
+  const bankScope = singlePage ? courseScope(course) : null;
   if (isFill) {
     if (!isSinglePageTask(questionsList)) {
       if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
@@ -2338,7 +2623,8 @@ async function studyTask(session, course, unit, auth) {
         indexMap,
         auth,
         minScorePct,
-        browserResult?.evidence?.fill_answers
+        browserResult?.evidence?.fill_answers,
+        bankScope
       );
       if (apiResult.status === "completed") {
         return { ...apiResult, evidence: { ...apiResult.evidence, fallback: "browser_to_api" } };
@@ -2348,7 +2634,7 @@ async function studyTask(session, course, unit, auth) {
     if (SETTINGS.enable_task_submit !== true) {
       return { status: "needs_human", reason: "\u586B\u7A7A\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
     }
-    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, void 0, bankScope);
   }
   if (isChoice) {
     if (!isSinglePageTask(questionsList)) {
@@ -2385,7 +2671,8 @@ async function studyTask(session, course, unit, auth) {
         indexMap,
         auth,
         minScorePct,
-        browserResult?.evidence?.choice_answers
+        browserResult?.evidence?.choice_answers,
+        bankScope
       );
       if (apiResult.status === "completed") {
         return { ...apiResult, evidence: { ...apiResult.evidence, fallback: "browser_to_api" } };
@@ -2395,13 +2682,13 @@ async function studyTask(session, course, unit, auth) {
     if (SETTINGS.enable_task_submit !== true) {
       return { status: "needs_human", reason: "\u9009\u62E9\u9898\u4F1A\u8BA1\u5206\uFF0CAPI \u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
     }
-    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, void 0, bankScope);
   }
   const isSequence = category === "sequence";
   const isMulti = category === "multichoice";
   if (isSequence || isMulti) {
     if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
-      return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+      return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, void 0, bankScope);
     }
     return { status: "needs_human", reason: "\u6392\u5E8F/\u591A\u9009\u9898\u4F1A\u8BA1\u5206\uFF0C\u81EA\u52A8\u63D0\u4EA4\u9ED8\u8BA4\u5173\u95ED" };
   }

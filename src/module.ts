@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { bindBank, confirmGroup, courseScope, lookupAnswers } from './bank';
 
 const MANIFEST = JSON.parse(
   readFileSync(new URL('./courseflow.module.json', import.meta.url), 'utf8'),
@@ -64,6 +65,8 @@ const BROWSER_HEADERS = {
 const write = (message: any) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const log = (level: string, message: string) =>
   process.stderr.write(`[unipus-classic] ${level} ${message}\n`);
+
+bindBank({ call: hostCall, log });
 
 let nextId = 1;
 const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
@@ -1015,6 +1018,7 @@ async function solveChoiceQuestions(
   session: string,
   group: any,
   context = '',
+  scope: string | null = null,
 ): Promise<Record<string, string[]> | null> {
   const questions = (group.questions ?? []).map((question: any, index: number) => ({
     id: String(index),
@@ -1025,6 +1029,26 @@ async function solveChoiceQuestions(
     })),
   }));
   if (questions.length === 0) return null;
+  const category = String(group.category ?? '').toLowerCase();
+  const out: Record<string, string[]> = {};
+  let pending = questions;
+  if (scope) {
+    const hits = await lookupAnswers(
+      session,
+      scope,
+      questions.map((question: any) => ({
+        index: Number(question.id),
+        category,
+        question: group.questions?.[Number(question.id)],
+      })),
+    );
+    for (const [index, captions] of Object.entries(hits)) out[index] = captions;
+    pending = questions.filter((question: any) => !out[question.id]);
+    if (Object.keys(out).length > 0) {
+      log('info', `bank choice hit ${Object.keys(out).length}/${questions.length}`);
+    }
+    if (pending.length === 0) return out;
+  }
   const contextBlock = context.trim()
     ? `听力/视频原文：\n${context.trim()}\n`
     : '';
@@ -1034,7 +1058,7 @@ async function solveChoiceQuestions(
     '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
     '选择题 texts 返回正确选项的 caption（A/B/C/D），如果不确定 caption，返回选项原文。',
     contextBlock,
-    JSON.stringify(questions),
+    JSON.stringify(pending),
   ].join('\n');
   if (context.trim()) log('info', `choice context ${context.trim().length} chars`);
   let parsed: any = null;
@@ -1055,7 +1079,6 @@ async function solveChoiceQuestions(
     }
   }
   if (!Array.isArray(parsed)) return null;
-  const out: Record<string, string[]> = {};
   for (const item of parsed) {
     if (!item || typeof item !== 'object') continue;
     const id = String(item.id ?? '');
@@ -1136,6 +1159,7 @@ async function solveMultiChoiceQuestions(
   session: string,
   group: any,
   context = '',
+  scope: string | null = null,
 ): Promise<Record<string, string[]> | null> {
   const questions = (group.questions ?? []).map((question: any, index: number) => ({
     id: String(index),
@@ -1146,15 +1170,47 @@ async function solveMultiChoiceQuestions(
     })),
   }));
   if (questions.length === 0) return null;
+  const category = String(group.category ?? '').toLowerCase();
+  const out: Record<string, string[]> = {};
+  let pending = questions;
+  if (scope) {
+    const hits = await lookupAnswers(
+      session,
+      scope,
+      questions.map((question: any) => ({
+        index: Number(question.id),
+        category,
+        question: group.questions?.[Number(question.id)],
+      })),
+    );
+    for (const [index, captions] of Object.entries(hits)) out[index] = captions;
+    pending = questions.filter((question: any) => !out[question.id]);
+    if (Object.keys(out).length > 0) {
+      log('info', `bank multiple hit ${Object.keys(out).length}/${questions.length}`);
+    }
+    if (pending.length === 0) return out;
+  }
   const prompt = [
     '你是 U校园英语练习答题助手。',
     '这是多选题，每道题可能有多个正确选项。',
     '根据听力/视频原文和题目，选出所有正确选项。',
     '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["A","C"]}。',
     context.trim() ? `听力/视频原文：\n${context.trim()}` : '',
-    JSON.stringify(questions),
+    JSON.stringify(pending),
   ].join('\n');
-  return answerMapFromItems(await askAiForItems(session, prompt));
+  const parsed = await askAiForItems(session, prompt);
+  if (!parsed) return null;
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue;
+    const id = String(item.id ?? '');
+    const texts = Array.isArray(item.texts)
+      ? item.texts.map(String)
+      : Array.isArray(item.answers)
+        ? item.answers.map(String)
+        : [];
+    if (id) out[id] = texts;
+  }
+  return out;
 }
 
 function parseVtt(text: string): string {
@@ -1344,19 +1400,41 @@ async function solveTextQuestions(
   session: string,
   group: any,
   context = '',
+  scope: string | null = null,
 ): Promise<Record<string, string[]> | null> {
   const questions = (group.questions ?? []).map((question: any, index: number) => ({
     id: String(index),
     stem: stripHtml(question?.content?.html),
   }));
   if (questions.length === 0) return null;
+  const category = String(group.category ?? '').toLowerCase();
+  const isFill = /fillblank/.test(category);
+  const out: Record<string, string[]> = {};
+  let pending = questions;
+  if (scope && isFill) {
+    const hits = await lookupAnswers(
+      session,
+      scope,
+      questions.map((question: any) => ({
+        index: Number(question.id),
+        category,
+        question: group.questions?.[Number(question.id)],
+      })),
+    );
+    for (const [index, texts] of Object.entries(hits)) out[index] = texts;
+    pending = questions.filter((question: any) => !out[question.id]);
+    if (Object.keys(out).length > 0) {
+      log('info', `bank fillblank hit ${Object.keys(out).length}/${questions.length}`);
+    }
+    if (pending.length === 0) return out;
+  }
   const prompt = [
     '你是 U校园英语练习答题助手。',
     '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
     '简答题/填空题给出简短、直接、符合题意的英文答案。',
     '原文里的 ____1____、____2____ 是待填空位，题目 id 对应空位编号，按编号填写。',
     context.trim() ? `听力/视频原文：\n${context.trim()}` : '',
-    JSON.stringify(questions),
+    JSON.stringify(pending),
   ].join('\n');
   let parsed: any = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1376,7 +1454,6 @@ async function solveTextQuestions(
     }
   }
   if (!Array.isArray(parsed)) return null;
-  const out: Record<string, string[]> = {};
   for (const item of parsed) {
     if (!item || typeof item !== 'object') continue;
     const id = String(item.id ?? '');
@@ -1588,10 +1665,11 @@ async function studyFillblankBrowser(
   minScorePct: number,
 ) {
   const courseId = course.content_id;
+  const scope = courseScope(course);
   let answers = scriptAnswers(decoded);
   if (answers.length === 0) {
     const context = await collectStudyContext(session, decoded);
-    const solved = await solveTextQuestions(session, questionGroup, context);
+    const solved = await solveTextQuestions(session, questionGroup, context, scope);
     if (solved) {
       answers = (questionGroup.questions ?? []).map(
         (_: any, index: number) => solved[String(index)]?.[0] ?? '',
@@ -1611,6 +1689,17 @@ async function studyFillblankBrowser(
     auth,
     minScorePct,
   );
+  if (result.status === 'completed' && scope && Number((result as any).evidence?.score ?? 0) >= 100) {
+    const saved = await confirmGroup(
+      session,
+      scope,
+      questionGroup.category,
+      questionGroup.questions ?? [],
+      answers,
+      `study:${groupId}:browser`,
+    );
+    if (saved > 0) log('info', `bank confirm fillblank ${saved} after 100`);
+  }
   return {
     ...result,
     evidence: { ...(result as any).evidence, fill_answers: answers },
@@ -1661,8 +1750,9 @@ async function studyChoiceBrowser(
   minScorePct: number,
 ) {
   const courseId = course.content_id;
+  const scope = courseScope(course);
   const context = await collectStudyContext(session, decoded);
-  const solved = await solveChoiceQuestions(session, questionGroup, context);
+  const solved = await solveChoiceQuestions(session, questionGroup, context, scope);
   if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
   const captions = choiceCaptions(questionGroup, solved);
   const result = await browserStudy(
@@ -1675,6 +1765,17 @@ async function studyChoiceBrowser(
     auth,
     minScorePct,
   );
+  if (result.status === 'completed' && scope && Number((result as any).evidence?.score ?? 0) >= 100) {
+    const saved = await confirmGroup(
+      session,
+      scope,
+      questionGroup.category,
+      questionGroup.questions ?? [],
+      captions,
+      `study:${groupId}:browser`,
+    );
+    if (saved > 0) log('info', `bank confirm choice ${saved} after 100`);
+  }
   return {
     ...result,
     evidence: { ...(result as any).evidence, choice_answers: captions },
@@ -1692,6 +1793,7 @@ async function studyObjectiveApi(
   auth: any,
   minScorePct: number,
   precomputedValues?: any[],
+  scope: string | null = null,
 ) {
   const category = String(questionGroup.category ?? '').toLowerCase();
   const isFill = /fillblank/.test(category);
@@ -1704,7 +1806,7 @@ async function studyObjectiveApi(
     if (values.length === 0) values = scriptAnswers(decoded);
     if (values.length === 0) {
       const context = await collectStudyContext(session, decoded);
-      const solved = await solveTextQuestions(session, questionGroup, context);
+      const solved = await solveTextQuestions(session, questionGroup, context, scope);
       if (!solved) return { status: 'needs_human', reason: 'fillblankScoop 没有答案来源' };
       values = questions.map((_: any, index: number) => solved[String(index)]?.[0] ?? '');
     }
@@ -1718,14 +1820,14 @@ async function studyObjectiveApi(
   } else if (isMulti) {
     if (values.length === 0) {
       const context = await collectStudyContext(session, decoded);
-      const solved = await solveMultiChoiceQuestions(session, questionGroup, context);
+      const solved = await solveMultiChoiceQuestions(session, questionGroup, context, scope);
       if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的多选题答案' };
       values = questions.map((_: any, index: number) => solved[String(index)] ?? []);
     }
   } else if (choice) {
     if (values.length === 0) {
       const context = await collectStudyContext(session, decoded);
-      const solved = await solveChoiceQuestions(session, choice.group, context);
+      const solved = await solveChoiceQuestions(session, choice.group, context, scope);
       if (!solved) return { status: 'needs_human', reason: '模型没有返回可用的选择题答案' };
       values = choiceCaptions(choice.group, solved);
     }
@@ -1841,6 +1943,17 @@ async function studyObjectiveApi(
   const submitState = Number(info?.state?.state ?? 0);
   const scorePct = Number(info?.state?.real_score_pct ?? info?.state?.score_pct ?? 0);
   const score = info?.state?.score ?? null;
+  if (submitState === 1 && scorePct === 100 && scope && !isSequence && !multiPage) {
+    const saved = await confirmGroup(
+      session,
+      scope,
+      category,
+      questions,
+      values,
+      `study:${groupId}:api`,
+    );
+    if (saved > 0) log('info', `bank confirm ${category} ${saved} after 100`);
+  }
   if (submitState === 1 && (minScorePct === 0 || scorePct >= minScorePct)) {
     return {
       status: 'completed',
@@ -2691,6 +2804,8 @@ async function studyTask(session: string, course: CourseContext, unit: any, auth
   const category = String(questionGroup.category ?? '').toLowerCase();
   const isFill = /fillblank/.test(category);
   const isChoice = category === 'singlechoice' || category === 'truefalse' || category === 'true_false' || category === 'choice';
+  const singlePage = isSinglePageTask(questionsList);
+  const bankScope = singlePage ? courseScope(course) : null;
   if (isFill) {
     if (!isSinglePageTask(questionsList)) {
       if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
@@ -2711,7 +2826,7 @@ async function studyTask(session: string, course: CourseContext, unit: any, auth
       log('warn', `browser did not submit ${groupId}, falling back to API`);
       const apiResult = await studyObjectiveApi(
         session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct,
-        browserResult?.evidence?.fill_answers,
+        browserResult?.evidence?.fill_answers, bankScope,
       );
       if (apiResult.status === 'completed') {
         return { ...apiResult, evidence: { ...(apiResult as any).evidence, fallback: 'browser_to_api' } };
@@ -2721,7 +2836,7 @@ async function studyTask(session: string, course: CourseContext, unit: any, auth
     if (SETTINGS.enable_task_submit !== true) {
       return { status: 'needs_human', reason: '填空题会计分，API 自动提交默认关闭' };
     }
-    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, undefined, bankScope);
   }
   if (isChoice) {
     if (!isSinglePageTask(questionsList)) {
@@ -2743,7 +2858,7 @@ async function studyTask(session: string, course: CourseContext, unit: any, auth
       log('warn', `browser did not submit ${groupId}, falling back to API`);
       const apiResult = await studyObjectiveApi(
         session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct,
-        browserResult?.evidence?.choice_answers,
+        browserResult?.evidence?.choice_answers, bankScope,
       );
       if (apiResult.status === 'completed') {
         return { ...apiResult, evidence: { ...(apiResult as any).evidence, fallback: 'browser_to_api' } };
@@ -2753,13 +2868,13 @@ async function studyTask(session: string, course: CourseContext, unit: any, auth
     if (SETTINGS.enable_task_submit !== true) {
       return { status: 'needs_human', reason: '选择题会计分，API 自动提交默认关闭' };
     }
-    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+    return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, undefined, bankScope);
   }
   const isSequence = category === 'sequence';
   const isMulti = category === 'multichoice';
   if (isSequence || isMulti) {
     if (BROWSER_STUDY || SETTINGS.enable_task_submit === true) {
-      return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct);
+      return studyObjectiveApi(session, courseId, groupId, decoded, questionGroup, questionsList, indexMap, auth, minScorePct, undefined, bankScope);
     }
     return { status: 'needs_human', reason: '排序/多选题会计分，自动提交默认关闭' };
   }
